@@ -1,0 +1,21 @@
+# 日志
+*.log
+
+# 测试视频 / 音频（测试输入及派生）
+*.mkv
+*.wav
+
+# 测试字幕 / 转写输出
+*.srt
+*.txt
+
+# 转写派生产物（对齐 items、指标）
+items.*.json
+metrics.*.json
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 会话/编辑器
+.claude/

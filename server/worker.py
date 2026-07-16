@@ -77,8 +77,8 @@ def _process_one(model, cfg, tdir, task_id, log):
     store.end_stage(tdir, "preprocessing")
     _tasklog(tdir, "preprocessing done")
 
-    # 2) 转写 + 对齐（耗时主体，含 OOM 自愈）。逐块回调真实进度写入 status.json，
-    #    前端据 progress_percent 渲染真进度条（无回调时退回不确定动画）。
+    # 2) 转写 + 对齐（耗时主体，GPU ASR/CPU 对齐逐块重叠，含 OOM 自愈）。逐块
+    #    回调真实进度写入 status.json，前端据此渲染（无回调时退回不确定动画）。
     store.start_stage(tdir, "transcribing")
     data = asr.transcribe(model, str(wav), language=cfg.get("asr_language"),  # None=自动判定
                           progress_cb=lambda p: store.update_progress(tdir, p))

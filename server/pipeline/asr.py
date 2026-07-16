@@ -3,10 +3,10 @@
 """ASR + 强制对齐（由 qwen3_asr_compare.py 去 CLI 化重构，详细设计 §4.3）。
 
 Qwen3-ASR-1.7B int8 全 GPU（bitsandbytes），Qwen3-ForcedAligner-0.6B 固定
-CPU（float32），4GB 显存可容纳。仅在 GPU Worker 子进程内导入（API 进程不触碰
-CUDA），故 torch / qwen_asr 均为函数内延迟导入。
+CPU（float32）。逐块 ASR 与上一块的对齐并行，以同时利用 GPU/CPU 且不增加显存
+占用。仅在 GPU Worker 子进程内导入 torch / qwen_asr，API 进程不触碰 CUDA。
 """
-import time
+from concurrent.futures import ThreadPoolExecutor
 
 
 def load_model(cfg: dict):
@@ -51,9 +51,6 @@ def load_model(cfg: dict):
     return Qwen3ASRModel.from_pretrained(cfg["asr_model_path"], **kwargs)
 
 
-_MISSING = object()
-
-
 def _is_oom(e: BaseException) -> bool:
     """判定是否为显存不足类错误。
 
@@ -68,94 +65,121 @@ def _is_oom(e: BaseException) -> bool:
     return isinstance(e, RuntimeError) and ("out of memory" in msg or "cuda driver error" in msg)
 
 
-class _ProgressPatch:
-    """把 qwen_asr 逐块推理换算成 0-100 的真实进度（详细设计 §4.3 P1）。
+class _Progress:
+    """按 N 次 ASR + 至多 N 次对齐上报真实完成量。"""
 
-    transcribe() 内部先 split_audio_into_chunks() 把整段音频切成 N 块，随后逐块
-    先做一次 ASR 生成、再做一次强制对齐；本项目 batch=1，故 generate/align 各被
-    调用一次/块（对齐会跳过静音块，略少）。总步数记为 2N，每完成一步回调百分比。
-
-    实现为「进 transcribe 前打补丁、出来后原样还原」：Worker 单进程串行，同一时刻
-    只有一个任务在跑，补丁不会互相污染。补丁点：
-      - _qa.split_audio_into_chunks：拿到 N（模块级函数，替换/还原都简单）
-      - model.model.generate：每次 ASR 解码 +batch
-      - model.forced_aligner.align：每次对齐 +batch
-    """
-
-    def __init__(self, model, cb):
-        self.model = model
+    def __init__(self, cb):
         self.cb = cb
-        self.n = 0          # 总块数（split 后确定）
-        self.done = 0       # 已完成步数（ASR 生成 + 对齐）
-        self.last = -1      # 上次上报的整百分比（去抖，避免每步都落盘）
-        self._saved = []    # [(obj, name, orig|_MISSING)] 供还原
-
-    def reset(self):
-        """OOM 重试会重新 split+推理，计数需归零以免翻倍。"""
-        self.n = self.done = 0
+        self.total = 0
+        self.done = 0
         self.last = -1
 
-    def _emit(self):
-        if self.n <= 0:
+    def reset(self, chunks: int) -> None:
+        """OOM 重试会重新推理；重置计数，下一步允许进度回退到真实值。"""
+        self.total = 2 * chunks
+        self.done = 0
+        self.last = -1
+
+    def complete(self) -> None:
+        if self.total <= 0:
             return
-        pct = max(1, min(99, int(self.done / (2 * self.n) * 100)))
-        if pct != self.last:
-            self.last = pct
-            try:
-                self.cb(pct)
-            except Exception:
-                pass  # 进度落盘失败绝不能拖垮转写
+        self.done += 1
+        pct = max(1, min(99, int(self.done / self.total * 100)))
+        if pct == self.last:
+            return
+        self.last = pct
+        try:
+            self.cb(pct)
+        except Exception:
+            pass  # 进度落盘失败绝不能拖垮转写
 
-    def _wrap(self, obj, name, make):
-        orig = getattr(obj, name)
-        had = name in getattr(obj, "__dict__", {})
-        setattr(obj, name, make(orig))
-        self._saved.append((obj, name, orig if had else _MISSING))
 
-    def install(self):
-        import qwen_asr.inference.qwen3_asr as _qa
+def _align_one(model, chunk, text: str, language: str):
+    """在 CPU 线程完成单块对齐并恢复其在原音频内的时间偏移。"""
+    result = model.forced_aligner.align(
+        audio=[(chunk.wav, chunk.sr)], text=[text], language=[language]
+    )[0]
+    return model._offset_align_result(result, chunk.offset_sec)
 
-        def split_maker(orig):
-            def wrap(*a, **k):
-                parts = orig(*a, **k)
-                self.n += len(parts)
-                return parts
-            return wrap
-        self._wrap(_qa, "split_audio_into_chunks", split_maker)
 
-        def gen_maker(orig):
-            def wrap(*a, **k):
-                out = orig(*a, **k)
-                ids = k.get("input_ids")
-                self.done += int(ids.shape[0]) if ids is not None else 1
-                self._emit()
-                return out
-            return wrap
-        self._wrap(self.model.model, "generate", gen_maker)
+def _transcribe_pipelined(model, audio_path: str, language, progress: _Progress | None):
+    """逐块 GPU ASR，并在单独 CPU 线程对齐上一块。
 
-        aligner = getattr(self.model, "forced_aligner", None)
-        if aligner is not None:
-            def align_maker(orig):
-                def wrap(*a, **k):
-                    out = orig(*a, **k)
-                    audio = k.get("audio") if "audio" in k else (a[0] if a else None)
-                    self.done += len(audio) if audio is not None else 1
-                    self._emit()
-                    return out
-                return wrap
-            self._wrap(aligner, "align", align_maker)
-        return self
+    qwen-asr 0.0.6 的原实现先完成全部 ASR 再开始全部对齐。本项目固定 batch=1，
+    因此可保持每次推理输入不变，把两段循环改排为容量 1 的两级流水线：主线程跑
+    第 i 块 ASR 时，CPU 线程跑第 i-1 块对齐。容量 1 提供自然背压，不会积压音频
+    块或在异常时等待一长串无用任务。
+    """
+    import qwen_asr.inference.qwen3_asr as _qa
 
-    def restore(self):
-        for obj, name, val in reversed(self._saved):
-            try:
-                if val is _MISSING:
-                    delattr(obj, name)
-                else:
-                    setattr(obj, name, val)
-            except Exception:
-                pass
-        self._saved.clear()
+    if model.forced_aligner is None:
+        raise ValueError("pipelined transcription requires a forced aligner")
+
+    wavs = _qa.normalize_audios(audio_path)
+    if len(wavs) != 1:
+        raise ValueError(f"expected one audio input, got {len(wavs)}")
+
+    if language is None or str(language).strip() == "":
+        language_norm = None
+    else:
+        language_norm = _qa.normalize_language_name(str(language))
+        _qa.validate_language(language_norm)
+
+    chunks = [
+        _qa.AudioChunk(orig_index=0, chunk_index=i, wav=wav, sr=_qa.SAMPLE_RATE,
+                       offset_sec=offset)
+        for i, (wav, offset) in enumerate(_qa.split_audio_into_chunks(
+            wav=wavs[0], sr=_qa.SAMPLE_RATE,
+            max_chunk_sec=_qa.MAX_FORCE_ALIGN_INPUT_SECONDS,
+        ))
+    ]
+    if progress:
+        progress.reset(len(chunks))
+
+    per_chunk_lang = []
+    per_chunk_text = []
+    per_chunk_align = [None] * len(chunks)
+    pending = None
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="forced-align")
+    try:
+        for idx, chunk in enumerate(chunks):
+            raw = model._infer_asr([""], [chunk.wav], [language_norm])[0]
+            lang_pred, text = _qa.parse_asr_output(raw, user_language=language_norm)
+            per_chunk_lang.append(lang_pred)
+            per_chunk_text.append(text)
+            if progress:
+                progress.complete()
+
+            # ASR 当前块时，pending 正在 CPU 对齐上一块；此处汇合后再投递当前块，
+            # 从而始终只有一个对齐任务在途。
+            if pending is not None:
+                align_idx, future = pending
+                per_chunk_align[align_idx] = future.result()
+                if progress:
+                    progress.complete()
+                pending = None
+
+            if text.strip():
+                pending = (idx, executor.submit(
+                    _align_one, model, chunk, text, lang_pred
+                ))
+
+        if pending is not None:
+            align_idx, future = pending
+            per_chunk_align[align_idx] = future.result()
+            if progress:
+                progress.complete()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    merged_text = "".join(text for text in per_chunk_text if text is not None)
+    merged_language = _qa.merge_languages(per_chunk_lang)
+    merged_align = model._merge_align_results(
+        [result for result in per_chunk_align if result is not None]
+    )
+    return _qa.ASRTranscription(
+        language=merged_language, text=merged_text, time_stamps=merged_align
+    )
 
 
 def transcribe(model, audio_path: str, language=None, progress_cb=None) -> dict:
@@ -163,42 +187,35 @@ def transcribe(model, audio_path: str, language=None, progress_cb=None) -> dict:
 
     OOM 自愈（R4）：捕获显存不足（含普通 RuntimeError 形态，见 _is_oom）→
     empty_cache → 原参重试 1 次；再失败由调用方标记 GPU_OOM。
-    progress_cb(pct:int)：可选，转写过程中按分块进度回调 1-99 的真实百分比。
+    progress_cb(pct:int)：可选，转写过程中按已完成的 ASR/对齐步数回调 1-99。
     """
     import torch
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    patch = _ProgressPatch(model, progress_cb).install() if progress_cb else None
+    progress = _Progress(progress_cb) if progress_cb else None
 
     def _run():
-        if patch:
-            patch.reset()
-        return model.transcribe(audio=audio_path, language=language,
-                                return_time_stamps=True)
+        with torch.no_grad():
+            return _transcribe_pipelined(model, audio_path, language, progress)
 
     try:
-        try:
-            results = _run()
-        except Exception as e:
-            if not _is_oom(e):
-                raise
-            # 显存不足：清缓存后原参重试一次。注意：若驱动级 OOM 已损坏 CUDA 上下文，
-            # 同进程重试通常仍失败并再次抛出，交由调用方标记 GPU_OOM（干净失败，
-            # 优于 Worker 硬退出的 WORKER_CRASHED）。
-            torch.cuda.empty_cache()
-            results = _run()
-    finally:
-        if patch:
-            patch.restore()
+        result = _run()
+    except Exception as e:
+        if not _is_oom(e):
+            raise
+        # 显存不足：清缓存后原参重试一次。注意：若驱动级 OOM 已损坏 CUDA 上下文，
+        # 同进程重试通常仍失败并再次抛出，交由调用方标记 GPU_OOM（干净失败，
+        # 优于 Worker 硬退出的 WORKER_CRASHED）。
+        torch.cuda.empty_cache()
+        result = _run()
 
-    r = results[0]
-    ts = r.time_stamps
+    ts = result.time_stamps
     items = getattr(ts, "items", None) if ts is not None else None
     data = {
-        "text": r.text,
-        "language": r.language,
+        "text": result.text,
+        "language": result.language,
         "items": [
             {"t": it.text, "s": float(it.start_time), "e": float(it.end_time)}
             for it in (items or [])

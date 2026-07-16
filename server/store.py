@@ -96,7 +96,7 @@ def new_status(tid: str, filename: str, duration: float, size: int) -> dict:
         "created_at": t,
         "updated_at": t,
         "finished_at": None,
-        "progress_percent": None,  # P1 分块级进度预留
+        "progress_percent": None,  # 分块 ASR/对齐的真实完成进度
         "stages": {s: None for s in STAGES},
         "error": None,
         "artifacts": [],

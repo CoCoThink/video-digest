@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""可配置项（详细设计 §9）。
+
+全部通过环境变量（前缀 ``VD_``）或 ``.env`` 覆盖，带工程默认值。API 进程与
+GPU Worker 子进程共享同一份配置：Worker 由 spawn 启动，父进程把
+``settings.model_dump()``（纯 dict，可 pickle）传入子进程。
+"""
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="VD_", env_file=".env", extra="ignore",
+        protected_namespaces=(),  # 允许 asr_model_path 等以 model 无关的字段名
+    )
+
+    # 服务
+    host: str = "0.0.0.0"
+    port: int = 8200
+    data_dir: Path = Path("./data")
+
+    # 模型（支持本地目录或 HF/ModelScope 仓库名，从缓存解析）
+    asr_model_path: str = "Qwen/Qwen3-ASR-1.7B"
+    aligner_model_path: str = "Qwen/Qwen3-ForcedAligner-0.6B"
+    load_8bit: bool = True
+    chunk_sec: int = 45  # 分块秒数（实测最优，4GB 显存峰值 3.02GB）
+    # 识别语言：None=自动判定（支持纯中文/纯英文/中英混合，验收 8）；也可强制
+    # "Chinese"/"English"。纯中文内容强制 Chinese 时断句更密、与实测参照物更贴近。
+    asr_language: str | None = None
+
+    # 队列与限额
+    queue_capacity: int = 10          # 含正在执行的任务
+    max_duration_sec: int = 10800     # 音频时长上限（3h）
+    max_size_bytes: int = 209_715_200  # 上传大小上限（200MB）
+
+    # 超时 = 时长 × factor + base（FR-B2）
+    timeout_factor: float = 3.0
+    timeout_base_sec: int = 600
+
+    # 前端预估用实时率（经 /api/config 下发）
+    rtf: float = 0.65
+
+    # 排版参数（build_srt_layout 默认值；R5 英文适配时按语言切换参数组）
+    layout_min_dur: float = 1.0
+    layout_max_dur: float = 7.0
+    layout_cps: float = 9.0
+    layout_line_width: int = 18
+    layout_merge_below: int = 4
+    layout_soft_min: int = 12
+    layout_hard_max: int = 34
+
+
+settings = Settings()

@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>在线视频生成字幕</title>
+  <link rel="stylesheet" href="/style.css?v=3">
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      <h1>在线视频生成字幕</h1>
+      <p class="sub">视频不出本机——浏览器内无损提取音轨，仅上传音频转写。</p>
+    </header>
+
+    <!-- idle：选择文件 -->
+    <section id="s-idle" class="card">
+      <label class="drop" id="drop">
+        <input type="file" id="file" accept="video/*,audio/*" hidden>
+        <div class="drop-inner">
+          <div class="drop-icon">🎬</div>
+          <div>点击选择或拖入视频 / 音频文件</div>
+          <div class="hint" id="limit-hint"></div>
+        </div>
+      </label>
+
+      <div id="history" class="history hidden">
+        <div class="hist-head">
+          <h3>历史任务</h3>
+          <button id="btn-refresh-hist" class="btn ghost sm" title="刷新">↻</button>
+        </div>
+        <ul id="history-list" class="hist-list"></ul>
+      </div>
+    </section>
+
+    <!-- 处理中 / 进度 -->
+    <section id="s-progress" class="card hidden">
+      <div class="row"><span class="k">文件</span><span id="p-name" class="v mono"></span></div>
+      <div class="row"><span class="k">状态</span><span id="p-state" class="v"></span></div>
+      <div class="bar"><div id="p-bar" class="bar-fill"></div></div>
+      <div id="p-detail" class="hint"></div>
+      <div class="row" id="p-taskid-row"><span class="k">任务号</span><span id="p-taskid" class="v mono"></span></div>
+      <div class="actions">
+        <button id="btn-cancel" class="btn ghost hidden">取消</button>
+        <button id="btn-retry-up" class="btn hidden">重试上传</button>
+      </div>
+    </section>
+
+    <!-- done：预览 + 下载 + 删除 -->
+    <section id="s-done" class="card hidden">
+      <div class="row"><span class="k">文件</span><span id="d-name" class="v mono"></span></div>
+      <div class="done-actions">
+        <a id="dl-srt" class="btn" download>下载 SRT</a>
+        <a id="dl-txt" class="btn ghost" download>下载纯文本</a>
+        <button id="btn-delete" class="btn danger">删除结果</button>
+        <button id="btn-new" class="btn ghost">处理新文件</button>
+      </div>
+      <h3>字幕预览</h3>
+      <div id="preview" class="preview"></div>
+    </section>
+
+    <!-- error / 终态提示 -->
+    <section id="s-error" class="card hidden">
+      <div class="err-icon">⚠️</div>
+      <div id="e-msg" class="err-msg"></div>
+      <pre id="e-hint" class="err-hint hidden"></pre>
+      <button id="btn-restart" class="btn">重新开始</button>
+    </section>
+  </main>
+
+  <script src="/vendor/ffmpeg/ffmpeg.js?v=4"></script>
+  <script src="/app.js?v=5"></script>
+</body>
+</html>

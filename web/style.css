@@ -1,0 +1,104 @@
+:root {
+  --bg: #0f1115;
+  --card: #1a1d24;
+  --line: #2a2e38;
+  --fg: #e6e8ec;
+  --muted: #8b909a;
+  --accent: #4f8cff;
+  --accent-2: #3a6fd8;
+  --danger: #e5534b;
+  --ok: #3fb950;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+.wrap { max-width: 720px; margin: 0 auto; padding: 40px 20px 80px; }
+header h1 { margin: 0 0 6px; font-size: 26px; }
+.sub { color: var(--muted); margin: 0 0 28px; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 24px;
+  margin-bottom: 20px;
+}
+.hidden { display: none !important; }
+.mono { font-family: "SFMono-Regular", Consolas, monospace; font-size: 13px; word-break: break-all; }
+
+/* 选择文件 */
+.drop { display: block; cursor: pointer; }
+.drop-inner {
+  border: 2px dashed var(--line);
+  border-radius: 12px;
+  padding: 48px 20px;
+  text-align: center;
+  transition: border-color .15s, background .15s;
+}
+.drop.hover .drop-inner { border-color: var(--accent); background: rgba(79,140,255,.06); }
+.drop-icon { font-size: 40px; margin-bottom: 10px; }
+.hint { color: var(--muted); font-size: 13px; margin-top: 8px; }
+
+/* 行 */
+.row { display: flex; gap: 12px; padding: 6px 0; }
+.row .k { color: var(--muted); width: 64px; flex: none; }
+.row .v { flex: 1; }
+
+/* 进度条 */
+.bar { height: 8px; background: var(--line); border-radius: 6px; overflow: hidden; margin: 14px 0 6px; }
+.bar-fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .3s; }
+
+/* 按钮 */
+.actions, .done-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+.btn {
+  display: inline-block;
+  background: var(--accent); color: #fff;
+  border: none; border-radius: 9px;
+  padding: 10px 18px; font-size: 14px;
+  cursor: pointer; text-decoration: none;
+}
+.btn:hover { background: var(--accent-2); }
+.btn.ghost { background: transparent; border: 1px solid var(--line); color: var(--fg); }
+.btn.ghost:hover { border-color: var(--accent); }
+.btn.danger { background: var(--danger); }
+.btn.danger:hover { filter: brightness(1.1); }
+
+/* 预览 */
+.preview { max-height: 420px; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; margin-top: 10px; }
+.cue { display: flex; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.cue:last-child { border-bottom: none; }
+.cue .t { color: var(--muted); font-family: monospace; font-size: 12px; flex: none; width: 82px; padding-top: 2px; }
+.cue .x { white-space: pre-wrap; }
+
+/* 历史任务 */
+.history { margin-top: 22px; border-top: 1px solid var(--line); padding-top: 16px; }
+.hist-head { display: flex; align-items: center; justify-content: space-between; }
+.hist-head h3 { margin: 0; font-size: 15px; }
+.btn.sm { padding: 4px 10px; font-size: 13px; line-height: 1; }
+.hist-list { list-style: none; margin: 12px 0 0; padding: 0; }
+.hist-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px;
+  margin-bottom: 8px; cursor: pointer; transition: border-color .15s, background .15s;
+}
+.hist-item:hover { border-color: var(--accent); background: rgba(79,140,255,.06); }
+.hist-main { flex: 1; min-width: 0; }
+.hist-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hist-meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.hist-badge { flex: none; font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); }
+.hist-badge.ok { color: var(--ok); border-color: rgba(63,185,80,.4); }
+.hist-badge.run { color: var(--accent); border-color: rgba(79,140,255,.4); }
+.hist-badge.muted { color: var(--muted); }
+.hist-del {
+  flex: none; background: transparent; border: none; color: var(--muted);
+  font-size: 15px; cursor: pointer; padding: 4px 6px; border-radius: 6px; line-height: 1;
+}
+.hist-del:hover { color: var(--danger); background: rgba(229,83,75,.1); }
+
+/* 错误 */
+.err-icon { font-size: 36px; }
+.err-msg { margin: 8px 0 14px; }
+.err-hint { background: #0c0e12; border: 1px solid var(--line); border-radius: 8px; padding: 12px; color: var(--muted); white-space: pre-wrap; font-size: 13px; }

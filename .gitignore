@@ -13,6 +13,10 @@
 items.*.json
 metrics.*.json
 
+# 运行时任务数据（每任务目录 / status.json / 产物）
+data/
+.env
+
 # Python 缓存
 __pycache__/
 *.pyc

@@ -116,6 +116,20 @@ def start_stage(tdir, stage: str) -> dict:
     return write_status(tdir, st)
 
 
+def update_progress(tdir, percent) -> None:
+    """写入转写阶段的分块级真实进度（0-100，P1）。
+
+    由 Worker 在 transcribing 阶段高频调用（每块 ASR/对齐完成一次），调用方已按
+    整百分比去抖，故此处每次落盘的次数≈块数×2，量级很小。读失败（极偶发的半截
+    写窗口）直接跳过，不影响主流程。
+    """
+    st = read_status(tdir)
+    if st is None:
+        return
+    st["progress_percent"] = max(0, min(100, int(percent)))
+    write_status(tdir, st)
+
+
 def end_stage(tdir, stage: str) -> dict:
     st = read_status(tdir)
     s = st["stages"].get(stage)

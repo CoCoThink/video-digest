@@ -26,7 +26,13 @@ class Settings(BaseSettings):
     asr_model_path: str = "Qwen/Qwen3-ASR-1.7B"
     aligner_model_path: str = "Qwen/Qwen3-ForcedAligner-0.6B"
     load_8bit: bool = True
-    chunk_sec: int = 45  # 分块秒数（实测最优，4GB 显存峰值 3.02GB）
+    # 分块秒数：每块 GPU 峰值随块长增长。4GB 卡上常驻 int8 模型基线约占 3.07GB
+    # reserved（仅 ~1GB 余量），而峰值是**内容相关**的——语速密集的块生成 token 多、
+    # 音频编码器激活大，单块瞬时分配可再高 0.5–1GB。45s 时密集块会越过 4GB，触发
+    # 驱动级 OOM（RuntimeError: CUDA driver error: out of memory）并可能损坏 CUDA
+    # 上下文致 Worker 硬退出（WORKER_CRASHED，见实现与踩坑）。降到 30s 收窄单块峰值、
+    # 留足余量；显存更大的卡可用 VD_CHUNK_SEC 调高。
+    chunk_sec: int = 30
     # 识别语言：None=自动判定（支持纯中文/纯英文/中英混合，验收 8）；也可强制
     # "Chinese"/"English"。纯中文内容强制 Chinese 时断句更密、与实测参照物更贴近。
     asr_language: str | None = None

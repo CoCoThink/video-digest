@@ -266,6 +266,15 @@ function renderStatus(st) {
     const pos = st.queue_position;
     setState(pos ? `排队中（第 ${pos} 位）` : "排队中", indeterminate());
     el("p-detail").textContent = "单 GPU 串行处理，轮到后自动开始。";
+  } else if (st.state === "transcribing" && typeof st.progress_percent === "number") {
+    // 分块级真实进度（后端逐块回调，见 worker/asr）；首块完成前 progress_percent
+    // 仍为 null，走下面的不确定动画兜底。
+    const pct = st.progress_percent;
+    setState(`转写中 ${pct}%`, pct);
+    const est = Math.round((st.audio_duration_sec || 0) * cfg.rtf);
+    el("p-detail").textContent = est
+      ? `音频时长 ${fmtSec(st.audio_duration_sec)}，预计转写约 ${fmtSec(est)}。`
+      : "";
   } else {
     setState(STAGE_TEXT[st.state] || st.state, indeterminate());
     const est = Math.round((st.audio_duration_sec || 0) * cfg.rtf);

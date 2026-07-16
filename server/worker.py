@@ -77,9 +77,11 @@ def _process_one(model, cfg, tdir, task_id, log):
     store.end_stage(tdir, "preprocessing")
     _tasklog(tdir, "preprocessing done")
 
-    # 2) 转写 + 对齐（耗时主体，含 OOM 自愈）
+    # 2) 转写 + 对齐（耗时主体，含 OOM 自愈）。逐块回调真实进度写入 status.json，
+    #    前端据 progress_percent 渲染真进度条（无回调时退回不确定动画）。
     store.start_stage(tdir, "transcribing")
-    data = asr.transcribe(model, str(wav), language=cfg.get("asr_language"))  # None=自动判定
+    data = asr.transcribe(model, str(wav), language=cfg.get("asr_language"),  # None=自动判定
+                          progress_cb=lambda p: store.update_progress(tdir, p))
     peak = data.pop("_peak_gpu_gb", None)
     import json as _json
     with open(tdir / "items.json", "w", encoding="utf-8") as f:
@@ -105,7 +107,11 @@ def _process_one(model, cfg, tdir, task_id, log):
 
 def _classify(e: Exception) -> str:
     name = type(e).__name__
-    if "OutOfMemory" in name or "OutOfMemoryError" in name:
+    msg = str(e).lower()
+    # 显存不足在 4GB 卡上多以普通 RuntimeError 形态出现（"CUDA driver error: out of
+    # memory" / "CUDA out of memory"），需按消息兜底，避免误判成 INTERNAL。
+    if ("OutOfMemory" in name or "out of memory" in msg
+            or "cuda driver error" in msg):
         return "GPU_OOM"
     return "INTERNAL"
 

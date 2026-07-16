@@ -40,7 +40,7 @@ VD_PYTHON=/path/to/python ./run.sh   # 指定解释器
 | `VD_DATA_DIR` | `./data` | 任务目录根 |
 | `VD_ASR_MODEL_PATH` / `VD_ALIGNER_MODEL_PATH` | Qwen 仓库名 | 支持本地目录 |
 | `VD_ASR_LANGUAGE` | `None`(自动) | 可强制 `Chinese`/`English` |
-| `VD_CHUNK_SEC` | `45` | 分块秒数（4GB 显存实测最优） |
+| `VD_CHUNK_SEC` | `30` | 分块秒数（4GB 卡单块峰值留余量；大显存卡可调高提速） |
 | `VD_QUEUE_CAPACITY` | `10` | 队列长度（含执行中） |
 | `VD_MAX_DURATION_SEC` / `VD_MAX_SIZE_BYTES` | `10800` / `200MB` | 时长/大小上限 |
 | `VD_TIMEOUT_FACTOR` / `VD_TIMEOUT_BASE_SEC` | `3` / `600` | 超时 = 时长×factor+base |

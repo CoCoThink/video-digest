@@ -144,13 +144,14 @@ async function loadFFmpeg() {
     coreURL: abs("/vendor/ffmpeg/ffmpeg-core.js"),
     wasmURL: abs("/vendor/ffmpeg/ffmpeg-core.wasm"),
   });
+  // WORKERFS 卸载后挂载点目录仍然存在，因此只在 worker 初始化时创建一次。
+  await ffmpeg.createDir("/in");
   return ffmpeg;
 }
 
 async function extractAudio(file) {
   const ff = await loadFFmpeg();
   lastLogDuration = null;
-  await ff.createDir("/in");
   await ff.mount("WORKERFS", { files: [file] }, "/in");  // 不整体复制进 wasm 内存
   try {
     const rc = await ff.exec([

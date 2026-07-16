@@ -8,18 +8,29 @@
 
 ## 运行
 
-需在已装好 Qwen3-ASR 栈的环境（本机为 mamba env `qwen-asr`：torch 2.9.1+cu128、qwen-asr 0.0.6、bitsandbytes、jieba、fastapi、uvicorn、ffmpeg 8.x）：
+需在已装好 Qwen3-ASR 栈的环境（本机为 mamba env `qwen-asr`：torch 2.9.1+cu128、qwen-asr 0.0.6、bitsandbytes、jieba、fastapi、uvicorn、ffmpeg 8.x）。
+
+**推荐用项目根的启动脚本 `run.sh`**（自动定位环境 Python、预检端口、打印地址）：
 
 ```bash
-# 项目根目录
-/home/guan/mamba/envs/qwen-asr/bin/python -m server.main
-# 或激活环境后： python -m server.main
+./run.sh                     # 前台启动（默认 :8200）
+VD_PORT=8300 ./run.sh        # 改端口（任意 VD_* 变量均可覆盖，见下表）
+VD_PYTHON=/path/to/python ./run.sh   # 指定解释器
+./run.sh --bg                # 后台启动，日志写入 ./server.log（kill <pid> 停止）
+```
+
+脚本会按 `VD_PYTHON` → 当前激活的 conda 环境 → `~/mamba|miniconda3|micromamba/envs/qwen-asr` → PATH 中 `python3` 的顺序定位解释器，并在启动前**预检端口可绑定**（WSL2/Hyper-V 保留端口段会 bind 失败但 `ss` 看不到监听者，见《实现与踩坑》§4.5）；不可绑定时给出换端口/`net stop winnat` 提示并退出。
+
+也可直接手动起：
+
+```bash
+/home/guan/mamba/envs/qwen-asr/bin/python -m server.main   # 或激活环境后 python -m server.main
 ```
 
 启动后：
 
 - 前端页面： <http://localhost:8200/>
-- 模型在 Worker 子进程内加载（约 14s），日志出现「模型就绪」后即可上传。
+- 模型在 Worker 子进程内加载（约 14s），日志出现模型加载完成后即可上传。
 
 ## 配置（环境变量前缀 `VD_`，详见设计 §9）
 
@@ -41,6 +52,7 @@
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/tasks` | 上传音频建任务（multipart：`file` + `filename`） |
+| GET | `/api/tasks` | 历史任务列表（最新在前，默认不含已删墓碑；`?include_deleted=true` 含之） |
 | GET | `/api/tasks/{id}` | 查询状态（含动态 `queue_position`），2s 轮询 |
 | DELETE | `/api/tasks/{id}` | 取消排队 / 删除完成任务（留墓碑） |
 | GET | `/api/tasks/{id}/result?format=srt\|txt` | 下载产物 |

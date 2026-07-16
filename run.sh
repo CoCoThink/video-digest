@@ -13,6 +13,15 @@ set -euo pipefail
 
 cd "$(dirname "$(readlink -f "$0")")"   # 切到项目根（脚本所在目录）
 
+# ---- 0) HuggingFace 镜像 --------------------------------------------------
+# 直连 huggingface.co 常超时（ReadTimeoutError），改用国内镜像下载/校验模型。
+# 关键：本机代理(HTTPS_PROXY)若走海外出口，hf-mirror 见到境外 IP 会 308 跳回
+# huggingface.co 再超时/504，故把 hf-mirror.com 加入 no_proxy 直连（国内 IP）。
+# 已 export 的 HF_ENDPOINT 优先，方便临时覆盖或走离线（HF_HUB_OFFLINE=1）。
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export no_proxy="${no_proxy:+$no_proxy,}hf-mirror.com"
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}hf-mirror.com"
+
 # ---- 1) 解析 Python 解释器 ------------------------------------------------
 pick_python() {
   if [[ -n "${VD_PYTHON:-}" ]]; then echo "$VD_PYTHON"; return; fi

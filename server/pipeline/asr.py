@@ -11,7 +11,19 @@ import time
 
 def load_model(cfg: dict):
     """加载常驻模型。cfg 为 settings.model_dump()（可 pickle 跨进程）。"""
+    import os
     import torch
+
+    # HuggingFace 镜像兜底：直连 huggingface.co 常超时（ReadTimeoutError）。HF_ENDPOINT
+    # 的镜像地址在 import huggingface_hub 时被冻结，故必须在 import qwen_asr 之前设置。
+    # setdefault → run.sh 已 export 的值优先，直接跑时才用镜像。
+    os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    # 且让 hf-mirror.com 绕过本机代理（no_proxy 由 requests 在请求时读取，可后设）：
+    # 代理走海外出口时，hf-mirror 见境外 IP 会 308 跳回 huggingface.co 再超时/504。
+    for _k in ("no_proxy", "NO_PROXY"):
+        _v = os.environ.get(_k, "")
+        if "hf-mirror.com" not in _v:
+            os.environ[_k] = f"{_v},hf-mirror.com" if _v else "hf-mirror.com"
 
     # 库在 transcribe() 时读取这两个模块级全局；缩小分块窗口让音频编码器卷积
     # 激活值放进小显存（45s 实测最优，见实测报告 §4）。

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -21,6 +22,7 @@ TERMINAL = {"done", "failed", "cancelled", "deleted"}
 
 # 转写完成/失败后需清理的中间音频（FR-B7：不留音频内容）。
 AUDIO_ARTIFACTS = ("upload.bin", "audio_16k.wav")
+UPLOAD_META = "upload.json"
 
 
 def now_iso() -> str:
@@ -107,6 +109,96 @@ def create_task(data_dir, tid: str, filename: str, duration: float, size: int) -
     tdir = task_dir(data_dir, tid)
     tdir.mkdir(parents=True, exist_ok=True)
     return write_status(tdir, new_status(tid, filename, duration, size))
+
+
+# ---------------------------------------------------------------------------
+# 分块上传会话
+# ---------------------------------------------------------------------------
+def create_upload(data_dir, tid: str, filename: str, total_size: int) -> dict:
+    """创建尚未入队的上传目录；upload_id 与最终 task_id 相同。"""
+    tdir = task_dir(data_dir, tid)
+    tdir.mkdir(parents=True, exist_ok=False)
+    (tdir / "upload.bin").touch()
+    meta = {
+        "upload_id": tid,
+        "filename": filename,
+        "total_size": int(total_size),
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    _atomic_write(tdir / UPLOAD_META, meta)
+    return meta
+
+
+def read_upload(tdir) -> dict | None:
+    path = Path(tdir) / UPLOAD_META
+    if not path.exists():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def touch_upload(tdir, meta: dict) -> dict:
+    meta = dict(meta)
+    meta["updated_at"] = now_iso()
+    _atomic_write(Path(tdir) / UPLOAD_META, meta)
+    return meta
+
+
+def finish_upload(tdir) -> None:
+    """任务状态落盘并入队后，移除上传会话标记。"""
+    try:
+        (Path(tdir) / UPLOAD_META).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def cleanup_stale_uploads(data_dir, max_age_sec: int) -> int:
+    """删除超时的未完成上传；已生成 status 的目录只移除残留会话标记。"""
+    root = tasks_root(data_dir)
+    if not root.exists():
+        return 0
+    cutoff = time.time() - max(0, int(max_age_sec))
+    removed = 0
+    for tdir in root.iterdir():
+        meta = tdir / UPLOAD_META
+        if not tdir.is_dir() or not meta.exists():
+            continue
+        if read_status(tdir) is not None:
+            finish_upload(tdir)
+            continue
+        try:
+            stale = meta.stat().st_mtime < cutoff
+        except OSError:
+            stale = False
+        if not stale:
+            continue
+        for child in tdir.iterdir():
+            if child.is_file():
+                try:
+                    child.unlink()
+                except OSError:
+                    pass
+        try:
+            tdir.rmdir()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def count_uploads(data_dir) -> int:
+    root = tasks_root(data_dir)
+    if not root.exists():
+        return 0
+    return sum(
+        1 for tdir in root.iterdir()
+        if tdir.is_dir() and (tdir / UPLOAD_META).exists()
+        and read_status(tdir) is None
+    )
 
 
 def start_stage(tdir, stage: str) -> dict:

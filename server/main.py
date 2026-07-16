@@ -5,14 +5,15 @@
 一条 uvicorn 进程：既提供 /api 路由，又用 StaticFiles 托管 web/（同源免 CORS）。
 本进程不 import torch、不触碰 CUDA；GPU 全在 Worker 子进程。
 """
+import asyncio
 import logging
-import os
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from . import store
 from .config import settings
@@ -25,9 +26,14 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [api] %(levelname)s %(message)s")
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-CHUNK = 1 << 20  # 1MB 流式落盘分块
 
 scheduler: Scheduler | None = None
+upload_locks: dict[str, asyncio.Lock] = {}
+
+
+class UploadInit(BaseModel):
+    filename: str = "subtitle"
+    size: int
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +45,10 @@ async def _lifespan(app: FastAPI):
     n = store.startup_recover(settings.data_dir)
     if n:
         log.info("启动恢复：%d 个中断任务标记为 failed(INTERRUPTED)。", n)
+    expired = store.cleanup_stale_uploads(
+        settings.data_dir, settings.upload_session_ttl_sec)
+    if expired:
+        log.info("启动清理：删除 %d 个过期的未完成上传。", expired)
     scheduler = Scheduler(settings)
     scheduler.start()
     yield
@@ -75,58 +85,147 @@ async def _no_cache_static(request: Request, call_next):
 # ---------------------------------------------------------------------------
 # API 路由
 # ---------------------------------------------------------------------------
-@app.post("/api/tasks", status_code=201)
-async def create_task(file: UploadFile = File(...), filename: str = Form(...)):
-    # 1) 队列容量检查（最廉价，先拒）
-    if scheduler.snapshot()["queue_depth"] >= settings.queue_capacity:
+@app.post("/api/uploads", status_code=201)
+async def init_upload(payload: UploadInit):
+    """创建分块上传会话，避免大请求被 Cloudflare 在到达源站前拒绝。"""
+    if payload.size <= 0:
+        raise of("EMPTY_AUDIO")
+    if payload.size > settings.max_size_bytes:
+        raise of("SIZE_EXCEEDED",
+                 f"音频超过 {settings.max_size_bytes // (1 << 20)}MB 上限。")
+    store.cleanup_stale_uploads(settings.data_dir, settings.upload_session_ttl_sec)
+    if _capacity_in_use() >= settings.queue_capacity:
         raise of("QUEUE_FULL")
-
-    # 2) 流式落盘 + 边写边计大小
     tid = store.gen_task_id()
-    tdir = store.task_dir(settings.data_dir, tid)
-    tdir.mkdir(parents=True, exist_ok=True)
-    upload = tdir / "upload.bin"
-    size = 0
+    filename = (payload.filename or "subtitle").strip()[:1024] or "subtitle"
     try:
-        with open(upload, "wb") as f:
-            while True:
-                chunk = await file.read(CHUNK)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > settings.max_size_bytes:
-                    raise of("SIZE_EXCEEDED",
-                             f"音频超过 {settings.max_size_bytes // (1 << 20)}MB 上限。")
-                f.write(chunk)
-        if size == 0:
-            raise of("EMPTY_AUDIO")
-
-        # 3) ffprobe 内容嗅探（子进程调用放线程池，避免阻塞事件循环）
-        from fastapi.concurrency import run_in_threadpool
-        duration = await run_in_threadpool(
-            probe_audio, str(upload), settings.max_duration_sec)
-
-        # 4) 建任务 / 入队
-        store.create_task(settings.data_dir, tid, filename or file.filename or "subtitle",
-                          duration, size)
-        if not scheduler.enqueue(tid):
-            raise of("QUEUE_FULL")
-    except ApiError:
-        _rmtree(tdir)
-        raise
-    except Exception as e:
-        _rmtree(tdir)
-        log.exception("创建任务失败")
-        raise of("INTERNAL") from e
-
-    pos = scheduler.position(tid)
+        store.create_upload(settings.data_dir, tid, filename, payload.size)
+    except Exception as exc:
+        log.exception("创建上传会话失败")
+        raise of("INTERNAL") from exc
     return {
-        "task_id": tid,
-        "state": "queued",
-        "queue_position": pos,
-        "audio_duration_sec": round(duration, 1),
-        "estimated_process_sec": round(duration * settings.rtf),
+        "upload_id": tid,
+        "chunk_size": settings.upload_chunk_size_bytes,
+        "received_size": 0,
     }
+
+
+@app.get("/api/uploads/{upload_id}")
+async def get_upload(upload_id: str):
+    tdir, meta = _require_upload(upload_id)
+    return {
+        "upload_id": upload_id,
+        "received_size": _upload_size(tdir),
+        "total_size": int(meta["total_size"]),
+        "chunk_size": settings.upload_chunk_size_bytes,
+    }
+
+
+@app.put("/api/uploads/{upload_id}")
+async def put_upload_chunk(upload_id: str, request: Request):
+    """按偏移追加一个原始二进制分块；失败时回滚本次部分写入。"""
+    _require_upload(upload_id)  # 不为伪造的随机 id 分配常驻锁对象
+    lock = upload_locks.setdefault(upload_id, asyncio.Lock())
+    async with lock:
+        tdir, meta = _require_upload(upload_id)
+        upload = tdir / "upload.bin"
+        actual = _upload_size(tdir)
+        try:
+            offset = int(request.headers.get("Upload-Offset", ""))
+        except ValueError:
+            raise of("BAD_UPLOAD", "缺少或无法识别 Upload-Offset。")
+        if offset != actual:
+            raise of("UPLOAD_OFFSET_MISMATCH",
+                     f"上传偏移不一致，服务端已接收 {actual} 字节。")
+
+        chunk_limit = max(1, int(settings.upload_chunk_size_bytes))
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > chunk_limit:
+                    raise of("UPLOAD_CHUNK_TOO_LARGE",
+                             f"单个分块不能超过 {chunk_limit} 字节。")
+            except ValueError:
+                raise of("BAD_UPLOAD", "Content-Length 无法识别。")
+
+        total = int(meta["total_size"])
+        written = 0
+        with open(upload, "r+b") as out:
+            out.seek(offset)
+            try:
+                async for part in request.stream():
+                    if not part:
+                        continue
+                    if written + len(part) > chunk_limit:
+                        raise of("UPLOAD_CHUNK_TOO_LARGE",
+                                 f"单个分块不能超过 {chunk_limit} 字节。")
+                    if offset + written + len(part) > total:
+                        raise of("SIZE_EXCEEDED", "上传内容超过声明的音频大小。")
+                    out.write(part)
+                    written += len(part)
+            except BaseException:
+                out.truncate(offset)
+                raise
+        if written == 0:
+            raise of("BAD_UPLOAD", "上传分块不能为空。")
+        store.touch_upload(tdir, meta)
+        return {"upload_id": upload_id, "received_size": offset + written}
+
+
+@app.delete("/api/uploads/{upload_id}")
+async def delete_upload(upload_id: str):
+    _require_upload(upload_id)
+    lock = upload_locks.setdefault(upload_id, asyncio.Lock())
+    async with lock:
+        tdir, _ = _require_upload(upload_id)
+        _rmtree(tdir)
+    upload_locks.pop(upload_id, None)
+    return {"state": "deleted"}
+
+
+@app.post("/api/uploads/{upload_id}/complete", status_code=201)
+async def complete_upload(upload_id: str):
+    """校验完整音频并创建任务；接口幂等，响应丢失后可安全重试。"""
+    if not store.valid_task_id(upload_id):
+        raise of("UPLOAD_NOT_FOUND")
+    tdir = store.task_dir(settings.data_dir, upload_id)
+    existing = store.read_status(tdir)
+    if existing is not None:
+        return _created_task_response(upload_id, existing.get("audio_duration_sec") or 0)
+
+    _require_upload(upload_id)
+    lock = upload_locks.setdefault(upload_id, asyncio.Lock())
+    try:
+        async with lock:
+            tdir, meta = _require_upload(upload_id)
+            size = _upload_size(tdir)
+            if size != int(meta["total_size"]):
+                raise of("UPLOAD_INCOMPLETE",
+                         f"音频尚未上传完整（{size}/{meta['total_size']} 字节）。")
+            if scheduler.snapshot()["queue_depth"] >= settings.queue_capacity:
+                raise of("QUEUE_FULL")
+
+            from fastapi.concurrency import run_in_threadpool
+            try:
+                duration = await run_in_threadpool(
+                    probe_audio, str(tdir / "upload.bin"), settings.max_duration_sec)
+            except ApiError:
+                _rmtree(tdir)
+                raise
+            except Exception as exc:
+                _rmtree(tdir)
+                log.exception("完成上传校验失败")
+                raise of("INTERNAL") from exc
+
+            store.create_task(settings.data_dir, upload_id, meta["filename"], duration, size)
+            if not scheduler.enqueue(upload_id):
+                _rmtree(tdir)
+                raise of("QUEUE_FULL")
+            store.finish_upload(tdir)
+    finally:
+        if store.read_upload(tdir) is None:
+            upload_locks.pop(upload_id, None)
+    return _created_task_response(upload_id, duration)
 
 
 @app.get("/api/tasks")
@@ -205,6 +304,7 @@ async def get_config():
         "rtf": settings.rtf,
         "max_duration_sec": settings.max_duration_sec,
         "max_size_bytes": settings.max_size_bytes,
+        "upload_chunk_size_bytes": settings.upload_chunk_size_bytes,
         "queue_capacity": settings.queue_capacity,
         "accepted_note": "任意 ffmpeg 可解码音频",
     }
@@ -229,6 +329,38 @@ def _require_task_dir(task_id: str) -> Path:
     if not store.valid_task_id(task_id):
         raise of("TASK_NOT_FOUND")                        # 非法 id 视为不存在
     return store.task_dir(settings.data_dir, task_id)
+
+
+def _require_upload(upload_id: str) -> tuple[Path, dict]:
+    if not store.valid_task_id(upload_id):
+        raise of("UPLOAD_NOT_FOUND")
+    tdir = store.task_dir(settings.data_dir, upload_id)
+    meta = store.read_upload(tdir)
+    if meta is None:
+        raise of("UPLOAD_NOT_FOUND")
+    return tdir, meta
+
+
+def _upload_size(tdir: Path) -> int:
+    try:
+        return (tdir / "upload.bin").stat().st_size
+    except OSError:
+        raise of("UPLOAD_NOT_FOUND")
+
+
+def _created_task_response(task_id: str, duration: float) -> dict:
+    return {
+        "task_id": task_id,
+        "state": "queued",
+        "queue_position": scheduler.position(task_id),
+        "audio_duration_sec": round(float(duration), 1),
+        "estimated_process_sec": round(float(duration) * settings.rtf),
+    }
+
+
+def _capacity_in_use() -> int:
+    return (scheduler.snapshot()["queue_depth"]
+            + store.count_uploads(settings.data_dir))
 
 
 def _rmtree(tdir: Path) -> None:

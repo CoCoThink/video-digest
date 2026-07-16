@@ -170,54 +170,168 @@ async function extractAudio(file) {
 }
 
 // ---------------------------------------------------------------------------
-// 上传（XHR：有上传进度；失败自动重试 1 次）
+// 上传（Cloudflare 友好的小分块；XHR 提供进度，失败后从服务端偏移续传）
 // ---------------------------------------------------------------------------
 let curXhr = null;
-function uploadAudio(blob, filename, isRetry) {
+let curUpload = null;
+let uploadGeneration = 0;
+
+async function uploadAudio(blob, filename) {
+  const generation = ++uploadGeneration;
   setState("上传音频…", 0);
+  el("p-detail").textContent = "";
   el("btn-cancel").classList.remove("hidden");
   el("btn-retry-up").classList.add("hidden");
 
-  const fd = new FormData();
-  const uploadName = /\.[a-z0-9]+$/i.test(filename) ? filename : filename + ".mka";
-  fd.append("file", blob, uploadName);
-  fd.append("filename", filename);
+  try {
+    if (!curUpload || curUpload.total !== blob.size || curUpload.filename !== filename) {
+      const session = await apiJson("/api/uploads", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename, size: blob.size }),
+      });
+      if (generation !== uploadGeneration) {
+        fetch("/api/uploads/" + encodeURIComponent(session.upload_id), { method: "DELETE" }).catch(() => {});
+        return;
+      }
+      curUpload = {
+        id: session.upload_id,
+        offset: session.received_size || 0,
+        chunkSize: session.chunk_size || cfg.upload_chunk_size_bytes || (16 << 20),
+        total: blob.size,
+        filename,
+      };
+    }
 
-  const xhr = new XMLHttpRequest();
-  curXhr = xhr;
-  xhr.open("POST", "/api/tasks");
-  xhr.upload.onprogress = (e) => { if (e.lengthComputable) setBar((e.loaded / e.total) * 100); };
-  xhr.onload = () => {
+    let retries = 0;
+    while (curUpload.offset < blob.size) {
+      if (generation !== uploadGeneration) return;
+      const start = curUpload.offset;
+      const end = Math.min(blob.size, start + curUpload.chunkSize);
+      try {
+        const result = await sendUploadChunk(
+          curUpload.id, start, blob.slice(start, end), blob.size, generation);
+        curUpload.offset = result.received_size;
+        retries = 0;
+      } catch (err) {
+        if (generation !== uploadGeneration) return;
+
+        // 响应丢失时，分块可能已落盘。先查询真实偏移，避免重复发送。
+        try {
+          const status = await apiJson("/api/uploads/" + encodeURIComponent(curUpload.id));
+          curUpload.offset = status.received_size;
+          if (curUpload.offset !== start) {
+            retries = 0;
+            continue;
+          }
+        } catch (syncErr) {
+          if (syncErr.status === 404) curUpload = null;
+          throw err;
+        }
+
+        // Cloudflare 区域若人为设置了更低上限，遇到 413 时继续缩小分块。
+        if (err.status === 413 && curUpload.chunkSize > (1 << 20)) {
+          curUpload.chunkSize = Math.max(1 << 20, Math.floor(curUpload.chunkSize / 2));
+          setState("上传分块过大，正在缩小后重试…", (start / blob.size) * 100);
+          continue;
+        }
+        if (retries++ < 1) {
+          setState("网络波动，正在续传…", (start / blob.size) * 100);
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    setState("上传完成，正在校验音频…", 100);
+    let completed;
+    try {
+      completed = await apiJson(
+        "/api/uploads/" + encodeURIComponent(curUpload.id) + "/complete",
+        { method: "POST" });
+    } catch (err) {
+      // complete 是幂等接口，网络错误或 5xx 可安全自动重试一次。
+      if (err.status && err.status < 500) throw err;
+      completed = await apiJson(
+        "/api/uploads/" + encodeURIComponent(curUpload.id) + "/complete",
+        { method: "POST" });
+    }
+    if (generation !== uploadGeneration) return;
+    acceptCreatedTask(completed);
+  } catch (err) {
+    if (generation !== uploadGeneration) return;
     curXhr = null;
     el("btn-cancel").classList.add("hidden");
-    let body = {};
-    try { body = JSON.parse(xhr.responseText); } catch (_) {}
-    if (xhr.status === 201) {
-      curTask = body.task_id;
-      history.replaceState(null, "", "?task=" + encodeURIComponent(curTask));
-      el("p-taskid-row").classList.remove("hidden");
-      el("p-taskid").textContent = curTask;
-      startPolling();
-    } else {
-      const msg = (body.error && body.error.message) || `上传失败（HTTP ${xhr.status}）`;
-      // 队列满/大小/时长等属确定性拒绝，不重试
-      showError(msg);
+    const permanent = new Set([
+      "SIZE_EXCEEDED", "DURATION_EXCEEDED", "NO_AUDIO_STREAM",
+      "DECODE_FAILED", "EMPTY_AUDIO", "BAD_UPLOAD",
+    ]);
+    if (permanent.has(err.code)) {
+      curUpload = null;
+      showError(err.message || "音频校验失败。");
+      return;
     }
-  };
-  xhr.onerror = () => {
-    curXhr = null;
-    if (!isRetry) { setState("上传失败，正在重试…", 0); uploadAudio(blob, filename, true); }
-    else {
-      el("btn-cancel").classList.add("hidden");
-      el("btn-retry-up").classList.remove("hidden");
-      setState("上传失败，可点“重试上传”（音频已在内存，无需重新提取）", 0);
-    }
-  };
-  xhr.send(fd);
+    if (err.status === 404) curUpload = null;
+    el("btn-retry-up").classList.remove("hidden");
+    setState((err.message || "上传失败") + " 可点“重试上传”继续。", 0);
+  }
+}
+
+function acceptCreatedTask(created) {
+  curTask = created.task_id;
+  curUpload = null;
+  el("btn-cancel").classList.add("hidden");
+  history.replaceState(null, "", "?task=" + encodeURIComponent(curTask));
+  el("p-taskid-row").classList.remove("hidden");
+  el("p-taskid").textContent = curTask;
+  startPolling();
+}
+
+function sendUploadChunk(uploadId, offset, chunk, total, generation) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    curXhr = xhr;
+    xhr.open("PUT", "/api/uploads/" + encodeURIComponent(uploadId));
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.setRequestHeader("Upload-Offset", String(offset));
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && generation === uploadGeneration) {
+        setBar(((offset + e.loaded) / total) * 100);
+      }
+    };
+    xhr.onload = () => {
+      if (curXhr === xhr) curXhr = null;
+      let body = {};
+      try { body = JSON.parse(xhr.responseText); } catch (_) {}
+      if (xhr.status >= 200 && xhr.status < 300) resolve(body);
+      else reject(responseError(xhr.status, body));
+    };
+    xhr.onerror = () => {
+      if (curXhr === xhr) curXhr = null;
+      reject(new Error("网络连接中断。"));
+    };
+    xhr.onabort = () => reject(new Error("上传已取消。"));
+    xhr.send(chunk);
+  });
+}
+
+async function apiJson(url, options) {
+  const response = await fetch(url, options);
+  let body = {};
+  try { body = await response.json(); } catch (_) {}
+  if (!response.ok) throw responseError(response.status, body);
+  return body;
+}
+
+function responseError(status, body) {
+  const detail = body && body.error;
+  const err = new Error((detail && detail.message) || `上传失败（HTTP ${status}）。`);
+  err.status = status;
+  err.code = detail && detail.code;
+  return err;
 }
 
 function cancelUpload() {
-  if (curXhr) { curXhr.abort(); curXhr = null; }
   resetToIdle();
 }
 
@@ -425,6 +539,12 @@ function showError(msg, hint, icon) {
   if (icon) document.querySelector(".err-icon").textContent = icon === "已删除" ? "🗑️" : "⚠️";
 }
 function resetToIdle() {
+  uploadGeneration++;
+  if (curXhr) { curXhr.abort(); curXhr = null; }
+  if (curUpload) {
+    fetch("/api/uploads/" + encodeURIComponent(curUpload.id), { method: "DELETE" }).catch(() => {});
+    curUpload = null;
+  }
   clearTimeout(pollTimer);
   curTask = null; audioBlob = null;
   history.replaceState(null, "", location.pathname);

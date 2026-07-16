@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     queue_capacity: int = 10          # 含正在执行的任务
     max_duration_sec: int = 10800     # 音频时长上限（3h）
     max_size_bytes: int = 209_715_200  # 上传大小上限（200MB）
+    # 单请求保持远低于 Cloudflare Free/Pro 的 100MB 请求体上限。
+    upload_chunk_size_bytes: int = 16_777_216  # 16MiB
+    upload_session_ttl_sec: int = 86_400       # 未完成上传保留 24h
 
     # 超时 = 时长 × factor + base（FR-B2）
     timeout_factor: float = 3.0

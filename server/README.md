@@ -41,8 +41,10 @@ VD_PYTHON=/path/to/python ./run.sh   # 指定解释器
 | `VD_ASR_MODEL_PATH` / `VD_ALIGNER_MODEL_PATH` | Qwen 仓库名 | 支持本地目录 |
 | `VD_ASR_LANGUAGE` | `None`(自动) | 可强制 `Chinese`/`English` |
 | `VD_CHUNK_SEC` | `30` | 分块秒数（4GB 卡单块峰值留余量；大显存卡可调高提速） |
-| `VD_QUEUE_CAPACITY` | `10` | 队列长度（含执行中） |
+| `VD_QUEUE_CAPACITY` | `10` | 容量上限（含上传中、排队中和执行中） |
 | `VD_MAX_DURATION_SEC` / `VD_MAX_SIZE_BYTES` | `10800` / `200MB` | 时长/大小上限 |
+| `VD_UPLOAD_CHUNK_SIZE_BYTES` | `16777216`（16MiB） | 浏览器分块上传的单请求大小；默认兼容 Cloudflare 代理 |
+| `VD_UPLOAD_SESSION_TTL_SEC` | `86400` | 未完成上传的保留时间，过期后自动清理 |
 | `VD_TIMEOUT_FACTOR` / `VD_TIMEOUT_BASE_SEC` | `3` / `600` | 超时 = 时长×factor+base |
 | `VD_RTF` | `0.65` | 预估实时率（经 /api/config 下发） |
 | `VD_LAYOUT_*` | — | 排版参数（min-dur/max-dur/cps/line-width/merge-below） |
@@ -51,7 +53,10 @@ VD_PYTHON=/path/to/python ./run.sh   # 指定解释器
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/tasks` | 上传音频建任务（multipart：`file` + `filename`） |
+| POST | `/api/uploads` | 初始化分块上传（JSON：`filename` + `size`） |
+| PUT | `/api/uploads/{id}` | 上传二进制分块（请求头：`Upload-Offset`） |
+| GET / DELETE | `/api/uploads/{id}` | 查询已接收偏移 / 取消并清理上传 |
+| POST | `/api/uploads/{id}/complete` | 校验完整音频并创建任务（幂等） |
 | GET | `/api/tasks` | 历史任务列表（最新在前，默认不含已删墓碑；`?include_deleted=true` 含之） |
 | GET | `/api/tasks/{id}` | 查询状态（含动态 `queue_position`），2s 轮询 |
 | DELETE | `/api/tasks/{id}` | 取消排队 / 删除完成任务（留墓碑） |
@@ -65,6 +70,7 @@ VD_PYTHON=/path/to/python ./run.sh   # 指定解释器
 - 转写阶段在主线程跑第 `i+1` 块 GPU ASR，同时用单个 CPU 线程对齐第 `i` 块；最多一个对齐任务在途，不增加模型或显存占用。120 秒/4 块实测由 119.366s 降至 84.337s（1.415x），正文、语言和 570 个时间戳与 qwen-asr 原串行路径完全一致。
 - 本机 GPU 为 4GB RTX 3050，`device_map={"":0}` 不可写成 `"cuda:0"`（触发 bnb SCB bug）。
 - 安全：task_id 128bit 随机 + 读取侧正则白名单；下载固定 `application/octet-stream + attachment`；预览用 `textContent`。生产公网暴露须在反向代理层加访问控制。
+- Cloudflare Free/Pro 的单请求上传上限为 100MB。页面固定以 16MiB 小请求续传，因此完整音频仍可使用本服务配置的 200MB 上限；不要把 `VD_UPLOAD_CHUNK_SIZE_BYTES` 调到代理上限附近。
 
 单元测试（需 qwen-asr 环境）：
 

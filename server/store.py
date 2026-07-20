@@ -87,7 +87,8 @@ def read_status(tdir) -> dict | None:
 # ---------------------------------------------------------------------------
 # 状态构造与推进
 # ---------------------------------------------------------------------------
-def new_status(tid: str, filename: str, duration: float, size: int) -> dict:
+def new_status(tid: str, filename: str, duration: float, size: int,
+               asr_backend: str | None = None, model_id: str | None = None) -> dict:
     t = now_iso()
     return {
         "task_id": tid,
@@ -95,6 +96,8 @@ def new_status(tid: str, filename: str, duration: float, size: int) -> dict:
         "original_filename": filename,
         "audio_duration_sec": round(float(duration), 1),
         "audio_size_bytes": int(size),
+        "asr_backend": asr_backend,
+        "model_id": model_id,
         "created_at": t,
         "updated_at": t,
         "finished_at": None,
@@ -105,10 +108,13 @@ def new_status(tid: str, filename: str, duration: float, size: int) -> dict:
     }
 
 
-def create_task(data_dir, tid: str, filename: str, duration: float, size: int) -> dict:
+def create_task(data_dir, tid: str, filename: str, duration: float, size: int,
+                asr_backend: str | None = None, model_id: str | None = None) -> dict:
     tdir = task_dir(data_dir, tid)
     tdir.mkdir(parents=True, exist_ok=True)
-    return write_status(tdir, new_status(tid, filename, duration, size))
+    return write_status(tdir, new_status(
+        tid, filename, duration, size, asr_backend=asr_backend, model_id=model_id,
+    ))
 
 
 # ---------------------------------------------------------------------------

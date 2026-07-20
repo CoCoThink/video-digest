@@ -9,6 +9,18 @@ CPU（float32）。逐块 ASR 与上一块的对齐并行，以同时利用 GPU/
 from concurrent.futures import ThreadPoolExecutor
 
 
+def create_backend(cfg: dict):
+    """Load the selected resident backend inside the GPU worker process."""
+    name = str(cfg.get("asr_backend", "qwen")).strip().lower()
+    if name == "qwen":
+        from server.pipeline.backends.qwen import QwenBackend
+        return QwenBackend(cfg)
+    if name == "firered":
+        from server.pipeline.backends.firered import FireRedBackend
+        return FireRedBackend(cfg)
+    raise ValueError(f"unsupported ASR backend: {name!r}")
+
+
 def load_model(cfg: dict):
     """加载常驻模型。cfg 为 settings.model_dump()（可 pickle 跨进程）。"""
     import os

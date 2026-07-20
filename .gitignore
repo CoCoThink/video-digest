@@ -8,10 +8,13 @@
 # 测试字幕 / 转写输出
 *.srt
 *.txt
+!requirements-firered.txt
 
 # 转写派生产物（对齐 items、指标）
 items.*.json
 metrics.*.json
+*.items.json
+*.metrics.json
 
 # 运行时任务数据（每任务目录 / status.json / 产物）
 data/

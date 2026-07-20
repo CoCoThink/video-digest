@@ -31,6 +31,9 @@ class Scheduler:
         self._task_q = None
         self._result_q = None
         self._worker = None
+        self._ready_ev = None
+        self._startup_q = None
+        self._startup_info = None
         self._stop = False
         self._thread = None
 
@@ -59,9 +62,13 @@ class Scheduler:
         # 每次都用全新队列，避免 respawn 后读到上一代残留消息。
         self._task_q = self._ctx.Queue()
         self._result_q = self._ctx.Queue()
+        self._ready_ev = self._ctx.Event()
+        self._startup_q = self._ctx.Queue()
+        self._startup_info = None
         self._worker = self._ctx.Process(
             target=worker_main,
-            args=(self._task_q, self._result_q, self.cfg),
+            args=(self._task_q, self._result_q, self.cfg,
+                  self._ready_ev, self._startup_q),
             name="vd-gpu-worker", daemon=True,
         )
         self._worker.start()
@@ -101,10 +108,22 @@ class Scheduler:
 
     def snapshot(self) -> dict:
         with self._cv:
+            try:
+                while True:
+                    self._startup_info = self._startup_q.get_nowait()
+            except (pyqueue.Empty, AttributeError):
+                pass
+            alive = bool(self._worker and self._worker.is_alive())
             return {
                 "queue_depth": len(self._deque) + (1 if self._current else 0),
                 "current_task_id": self._current,
-                "worker_alive": bool(self._worker and self._worker.is_alive()),
+                "worker_alive": alive,
+                "model_loaded": bool(
+                    alive and self._ready_ev and self._ready_ev.is_set()
+                ),
+                "startup_error": (
+                    self._startup_info.get("error") if self._startup_info else None
+                ),
             }
 
     # --- dispatcher 主循环 -----------------------------------------------

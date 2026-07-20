@@ -23,7 +23,7 @@ def _ensure_path():
         sys.path.insert(0, root)
 
 
-def worker_main(task_q, result_q, cfg: dict, ready_ev=None):
+def worker_main(task_q, result_q, cfg: dict, ready_ev=None, startup_q=None):
     """子进程入口。cfg = settings.model_dump()。"""
     _ensure_path()
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
@@ -37,12 +37,23 @@ def worker_main(task_q, result_q, cfg: dict, ready_ev=None):
                         format="%(asctime)s [worker] %(levelname)s %(message)s")
 
     data_dir = cfg["data_dir"]
-    log.info("加载模型 %s (load_8bit=%s, chunk=%ss) ...",
-             cfg["asr_model_path"], cfg["load_8bit"], cfg["chunk_sec"])
-    model = asr.load_model(cfg)
-    log.info("模型就绪，进入任务循环。")
+    log.info("加载 ASR backend=%s (chunk=%ss) ...",
+             cfg.get("asr_backend", "qwen"), cfg["chunk_sec"])
+    try:
+        backend = asr.create_backend(cfg)
+    except Exception as exc:
+        if startup_q is not None:
+            startup_q.put({
+                "backend": cfg.get("asr_backend", "qwen"),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+        raise
+    log.info("模型就绪：backend=%s model=%s，进入任务循环。",
+             backend.name, backend.model_id)
     if ready_ev is not None:
         ready_ev.set()
+    if startup_q is not None:
+        startup_q.put({"backend": backend.name, "model_id": backend.model_id})
 
     while True:
         task_id = task_q.get()
@@ -50,7 +61,7 @@ def worker_main(task_q, result_q, cfg: dict, ready_ev=None):
             break
         tdir = store.task_dir(data_dir, task_id)
         try:
-            _process_one(model, cfg, tdir, task_id, log)
+            _process_one(backend, cfg, tdir, task_id, log)
             result_q.put((task_id, "ok"))
         except Exception as e:       # 业务失败：落盘 failed + 堆栈，仍清理音频
             code = _classify(e)
@@ -62,7 +73,7 @@ def worker_main(task_q, result_q, cfg: dict, ready_ev=None):
             result_q.put((task_id, "failed"))
 
 
-def _process_one(model, cfg, tdir, task_id, log):
+def _process_one(backend, cfg, tdir, task_id, log):
     from server import store
     from server.pipeline import preprocess, asr, layout, subtitle
 
@@ -80,15 +91,20 @@ def _process_one(model, cfg, tdir, task_id, log):
     # 2) 转写 + 对齐（耗时主体，GPU ASR/CPU 对齐逐块重叠，含 OOM 自愈）。逐块
     #    回调真实进度写入 status.json，前端据此渲染（无回调时退回不确定动画）。
     store.start_stage(tdir, "transcribing")
-    data = asr.transcribe(model, str(wav), language=cfg.get("asr_language"),  # None=自动判定
-                          progress_cb=lambda p: store.update_progress(tdir, p))
+    data = backend.transcribe(
+        str(wav), language=cfg.get("asr_language"),
+        progress_cb=lambda p: store.update_progress(tdir, p),
+    )
     peak = data.pop("_peak_gpu_gb", None)
+    punc_sec = data.pop("_punc_sec", None)
     import json as _json
     with open(tdir / "items.json", "w", encoding="utf-8") as f:
         _json.dump(data, f, ensure_ascii=False)
     store.end_stage(tdir, "transcribing")
-    _tasklog(tdir, f"transcribing done lang={data.get('language')} "
-                   f"tokens={len(data['items'])} chars={len(data['text'])} peak_gpu={peak}GB")
+    _tasklog(tdir, f"transcribing done backend={data.get('backend')} "
+                   f"model={data.get('model_id')} lang={data.get('language')} "
+                   f"tokens={len(data['items'])} chars={len(data['text'])} "
+                   f"punc_sec={punc_sec} peak_gpu={peak}GB")
 
     # 3) 后处理：断句 + 排版 + 产物
     store.start_stage(tdir, "postprocessing")
@@ -113,12 +129,20 @@ def _classify(e: Exception) -> str:
     if ("OutOfMemory" in name or "out of memory" in msg
             or "cuda driver error" in msg):
         return "GPU_OOM"
+    if name == "AsrUnstableError":
+        return "ASR_UNSTABLE"
+    if name == "AsrOutputError":
+        return "ASR_OUTPUT_MISMATCH"
     return "INTERNAL"
 
 
 def _message_for(code: str, e: Exception) -> str:
     if code == "GPU_OOM":
         return "显存不足，转写失败，请重试或改用更短音频。"
+    if code == "ASR_UNSTABLE":
+        return "模型在局部音频上输出异常，已缩短分块重试但仍未恢复。"
+    if code == "ASR_OUTPUT_MISMATCH":
+        return "模型正文与时间戳不一致，已停止生成字幕。"
     return "任务处理失败，请重试或联系管理员。"
 
 

@@ -1,0 +1,6 @@
+# Additional packages required by FireRedASR2-AED in the existing qwen-asr env.
+# torch/torchaudio are intentionally inherited from that CUDA environment.
+cn2an==0.5.23
+kaldiio==2.18.1
+kaldi_native_fbank==1.15
+textgrid==1.6.1

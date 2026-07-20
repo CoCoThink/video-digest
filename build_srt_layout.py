@@ -22,6 +22,7 @@ reported (its underlying alignment span is genuinely that short).
 """
 import argparse
 import json
+import unicodedata
 
 try:
     import jieba
@@ -55,6 +56,11 @@ def visible_len(text):
     return sum(1 for ch in text if ch.strip() and ch not in PUNCT)
 
 
+def _is_aligner_char(ch):
+    """Match Qwen3ForceAlignProcessor.clean_token's character filter."""
+    return ch == "'" or unicodedata.category(ch)[:1] in {"L", "N"}
+
+
 def word_starts(text):
     """Set of char indices at which a jieba word begins (i.e. safe break points).
     A break between text[i-1] and text[i] splits a word iff i is NOT in this set.
@@ -77,30 +83,32 @@ def word_starts(text):
 def align_chars(data):
     text = data["text"]
     items = data["items"]
+    aligned = [
+        (ch, item["s"], item["e"])
+        for item in items
+        for ch in item["t"]
+    ]
+    source = "".join(ch for ch in text if _is_aligner_char(ch))
+    target = "".join(ch for ch, _, _ in aligned)
+    if source != target:
+        mismatch = next(
+            (i for i, (left, right) in enumerate(zip(source, target)) if left != right),
+            min(len(source), len(target)),
+        )
+        raise ValueError(
+            "ASR text and forced-alignment tokens differ at normalized character "
+            f"{mismatch} (text={len(source)}, aligned={len(target)})"
+        )
+
     timed = []          # (char, start|None, end|None)
-    ti = 0
-    ci = 0
+    aligned_index = 0
     for ch in text:
-        if ch.strip() == "" or ch in PUNCT:
+        if not _is_aligner_char(ch):
             timed.append((ch, None, None))
             continue
-        matched = False
-        scan = 0
-        while ti < len(items) and scan < 3:
-            tok = items[ti]["t"]
-            if ci >= len(tok):
-                ti += 1
-                ci = 0
-                continue
-            if tok[ci] == ch:
-                timed.append((ch, items[ti]["s"], items[ti]["e"]))
-                ci += 1
-                matched = True
-                break
-            ci += 1
-            scan += 1
-        if not matched:
-            timed.append((ch, None, None))
+        _, start, end = aligned[aligned_index]
+        timed.append((ch, start, end))
+        aligned_index += 1
     return timed
 
 
@@ -183,6 +191,19 @@ def merge_short(cues, merge_below=4, cap=22, max_gap=0.5):
 # only into the free gap before the next cue; fix overlaps (rule 6).
 # ---------------------------------------------------------------------------
 def retime(cues, min_dur=1.0, cps=9.0, max_dur=7.0, min_gap=0.04):
+    # A point-timestamp phrase cannot be shown before a following phrase with the
+    # same start without overlap. Fold it into the later phrase's real span.
+    merged = []
+    for cue in cues:
+        cue = cue[:]
+        if merged and cue[0] - merged[-1][0] <= min_gap:
+            previous = merged.pop()
+            cue[0] = min(previous[0], cue[0])
+            cue[1] = max(previous[1], cue[1])
+            cue[2] = previous[2] + cue[2]
+        merged.append(cue)
+    cues[:] = merged
+
     too_fast = []
     clipped = 0
     for i, c in enumerate(cues):

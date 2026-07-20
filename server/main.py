@@ -217,7 +217,11 @@ async def complete_upload(upload_id: str):
                 log.exception("完成上传校验失败")
                 raise of("INTERNAL") from exc
 
-            store.create_task(settings.data_dir, upload_id, meta["filename"], duration, size)
+            store.create_task(
+                settings.data_dir, upload_id, meta["filename"], duration, size,
+                asr_backend=settings.asr_backend,
+                model_id=_selected_model_id(),
+            )
             if not scheduler.enqueue(upload_id):
                 _rmtree(tdir)
                 raise of("QUEUE_FULL")
@@ -301,7 +305,11 @@ async def download_result(task_id: str, format: str = "srt"):
 @app.get("/api/config")
 async def get_config():
     return {
-        "rtf": settings.rtf,
+        "rtf": _selected_rtf(),
+        "asr_backend": settings.asr_backend,
+        "punctuation_enabled": (
+            settings.asr_backend == "firered" and settings.firered_punc_enabled
+        ),
         "max_duration_sec": settings.max_duration_sec,
         "max_size_bytes": settings.max_size_bytes,
         "upload_chunk_size_bytes": settings.upload_chunk_size_bytes,
@@ -313,10 +321,15 @@ async def get_config():
 @app.get("/api/health")
 async def health():
     snap = scheduler.snapshot() if scheduler else {}
+    loaded = snap.get("model_loaded", False)
+    alive = snap.get("worker_alive", False)
     return {
-        "status": "ok",
-        "model_loaded": snap.get("worker_alive", False),
-        "worker_alive": snap.get("worker_alive", False),
+        "status": "ok" if loaded else ("loading" if alive else "error"),
+        "backend": settings.asr_backend,
+        "model_id": _selected_model_id(),
+        "model_loaded": loaded,
+        "worker_alive": alive,
+        "startup_error": snap.get("startup_error"),
         "queue_depth": snap.get("queue_depth", 0),
         "current_task_id": snap.get("current_task_id"),
     }
@@ -325,6 +338,17 @@ async def health():
 # ---------------------------------------------------------------------------
 # 辅助
 # ---------------------------------------------------------------------------
+def _selected_model_id() -> str:
+    if settings.asr_backend == "firered":
+        suffix = "+FireRedPunc" if settings.firered_punc_enabled else ""
+        return f"FireRedASR2-AED{suffix}"
+    return settings.asr_model_path
+
+
+def _selected_rtf() -> float:
+    return settings.firered_rtf if settings.asr_backend == "firered" else settings.rtf
+
+
 def _require_task_dir(task_id: str) -> Path:
     if not store.valid_task_id(task_id):
         raise of("TASK_NOT_FOUND")                        # 非法 id 视为不存在

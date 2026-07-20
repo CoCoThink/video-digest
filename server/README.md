@@ -4,7 +4,7 @@
 
 ## 架构一句话
 
-浏览器用 ffmpeg.wasm 无损提取音轨（视频不出本机）→ 仅音频上传 → **API 进程**（FastAPI，不碰 CUDA）校验入队 → **常驻 GPU Worker 子进程**（Qwen3-ASR-1.7B int8 全 GPU + 对齐 0.6B CPU，逐块流水线重叠）转写 → 标点断句 + 排版规范化 → SRT/TXT。文件系统即状态，无数据库。
+浏览器用 ffmpeg.wasm 无损提取音轨（视频不出本机）→ 仅音频上传 → **API 进程**（FastAPI，不碰 CUDA）校验入队 → **常驻 GPU Worker 子进程**（默认 Qwen3-ASR-1.7B int8，也可启动为 FireRedASR2-AED 快速模式）转写 → 标点断句 + 排版规范化 → SRT/TXT。文件系统即状态，无数据库。
 
 ## 运行
 
@@ -16,6 +16,10 @@
 ./run.sh                     # 前台启动（默认 :8200）
 VD_PORT=8300 ./run.sh        # 改端口（任意 VD_* 变量均可覆盖，见下表）
 VD_PYTHON=/path/to/python ./run.sh   # 指定解释器
+VD_ASR_BACKEND=firered VD_FIRERED_MODEL_PATH=/models/FireRedASR2-AED \
+  VD_FIRERED_SOURCE_DIR=/opt/FireRedASR2S \
+  VD_FIRERED_PUNC_ENABLED=true VD_FIRERED_PUNC_MODEL_PATH=/models/FireRedPunc \
+  ./run.sh
 ./run.sh --bg                # 后台启动，日志写入 ./server.log（kill <pid> 停止）
 ```
 
@@ -32,13 +36,29 @@ VD_PYTHON=/path/to/python ./run.sh   # 指定解释器
 - 前端页面： <http://localhost:8200/>
 - 模型在 Worker 子进程内加载（约 14s），日志出现模型加载完成后即可上传。
 
+FireRed 源码需固定到实测 revision：
+
+```bash
+pip install -r requirements-firered.txt
+git clone https://github.com/FireRedTeam/FireRedASR2S.git /opt/FireRedASR2S
+git -C /opt/FireRedASR2S checkout 4e7d9aaf4482a47cec1724807026b9b151926eb5
+modelscope download --model xukaituo/FireRedPunc --local_dir /models/FireRedPunc
+```
+
 ## 配置（环境变量前缀 `VD_`，详见设计 §9）
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `VD_HOST` / `VD_PORT` | `0.0.0.0` / `8200` | 监听 |
 | `VD_DATA_DIR` | `./data` | 任务目录根 |
+| `VD_ASR_BACKEND` | `qwen` | 启动级切换：`qwen` / `firered` |
 | `VD_ASR_MODEL_PATH` / `VD_ALIGNER_MODEL_PATH` | Qwen 仓库名 | 支持本地目录 |
+| `VD_FIRERED_MODEL_PATH` | 空 | FireRedASR2-AED checkpoint 目录；选择 `firered` 时必填 |
+| `VD_FIRERED_SOURCE_DIR` | 空 | 固定版本 FireRedASR2S 源码目录；已安装包时可省略 |
+| `VD_FIRERED_BEAM_SIZE` / `VD_FIRERED_MIN_CHUNK_SEC` | `1` / `7.5` | FireRed 解码与异常递归下限 |
+| `VD_FIRERED_PUNC_ENABLED` | `false` | FireRed 模式启用官方标点恢复 |
+| `VD_FIRERED_PUNC_MODEL_PATH` | 空 | FireRedPunc checkpoint；启用标点时必填 |
+| `VD_FIRERED_PUNC_DEVICE` | `cpu` | `cpu` / `cuda`；4GB GPU 推荐 CPU |
 | `VD_ASR_LANGUAGE` | `None`(自动) | 可强制 `Chinese`/`English` |
 | `VD_CHUNK_SEC` | `30` | 分块秒数（4GB 卡单块峰值留余量；大显存卡可调高提速） |
 | `VD_QUEUE_CAPACITY` | `10` | 容量上限（含上传中、排队中和执行中） |
@@ -47,6 +67,7 @@ VD_PYTHON=/path/to/python ./run.sh   # 指定解释器
 | `VD_UPLOAD_SESSION_TTL_SEC` | `86400` | 未完成上传的保留时间，过期后自动清理 |
 | `VD_TIMEOUT_FACTOR` / `VD_TIMEOUT_BASE_SEC` | `3` / `600` | 超时 = 时长×factor+base |
 | `VD_RTF` | `0.65` | 预估实时率（经 /api/config 下发） |
+| `VD_FIRERED_RTF` | `0.12` | FireRed 模式预估实时率 |
 | `VD_LAYOUT_*` | — | 排版参数（min-dur/max-dur/cps/line-width/merge-below） |
 
 ## API（详见设计 §6）
@@ -68,6 +89,8 @@ VD_PYTHON=/path/to/python ./run.sh   # 指定解释器
 
 - `server/pipeline/` 由根目录实验脚本（`qwen3_asr_compare.py` / `build_srt_layout.py`）逐行等价迁移；给定相同 ASR 输出，产物与独立脚本**逐字节一致**。
 - 转写阶段在主线程跑第 `i+1` 块 GPU ASR，同时用单个 CPU 线程对齐第 `i` 块；最多一个对齐任务在途，不增加模型或显存占用。120 秒/4 块实测由 119.366s 降至 84.337s（1.415x），正文、语言和 570 个时间戳与 qwen-asr 原串行路径完全一致。
+- FireRedPunc 启用后默认在 CPU 常驻，逐 30 秒主块恢复标点；字符投影守门保证字母、数字、大小写和词内撇号来自原始 ASR，改词或推理失败时仅降级当前块。95/157 分钟样本标点 RTF 为 0.00271/0.00251，语义字符保留率 100%，FireRed 部署推荐启用。
+- 已有 FireRed `items.json` 可用 `fireredpunc_items.py` 离线重建带标点的 SRT/TXT 和指标，便于回归比较而无需重跑 ASR。
 - 本机 GPU 为 4GB RTX 3050，`device_map={"":0}` 不可写成 `"cuda:0"`（触发 bnb SCB bug）。
 - 安全：task_id 128bit 随机 + 读取侧正则白名单；下载固定 `application/octet-stream + attachment`；预览用 `textContent`。生产公网暴露须在反向代理层加访问控制。
 - Cloudflare Free/Pro 的单请求上传上限为 100MB。页面固定以 16MiB 小请求续传，因此完整音频仍可使用本服务配置的 200MB 上限；不要把 `VD_UPLOAD_CHUNK_SIZE_BYTES` 调到代理上限附近。

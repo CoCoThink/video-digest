@@ -1,5 +1,5 @@
-# Additional packages required by FireRedASR2-AED in the existing qwen-asr env.
-# torch/torchaudio are intentionally inherited from that CUDA environment.
+# FireRedASR2-AED additions on top of the pinned service environment.
+-r requirements.txt
 cn2an==0.5.23
 kaldiio==2.18.1
 kaldi_native_fbank==1.15

@@ -308,7 +308,8 @@ async def get_config():
         "rtf": _selected_rtf(),
         "asr_backend": settings.asr_backend,
         "punctuation_enabled": (
-            settings.asr_backend == "firered" and settings.firered_punc_enabled
+            settings.asr_backend == "funasr"
+            or (settings.asr_backend == "firered" and settings.firered_punc_enabled)
         ),
         "max_duration_sec": settings.max_duration_sec,
         "max_size_bytes": settings.max_size_bytes,
@@ -342,11 +343,17 @@ def _selected_model_id() -> str:
     if settings.asr_backend == "firered":
         suffix = "+FireRedPunc" if settings.firered_punc_enabled else ""
         return f"FireRedASR2-AED{suffix}"
+    if settings.asr_backend == "funasr":
+        return settings.funasr_model_path
     return settings.asr_model_path
 
 
 def _selected_rtf() -> float:
-    return settings.firered_rtf if settings.asr_backend == "firered" else settings.rtf
+    if settings.asr_backend == "firered":
+        return settings.firered_rtf
+    if settings.asr_backend == "funasr":
+        return settings.funasr_rtf
+    return settings.rtf
 
 
 def _require_task_dir(task_id: str) -> Path:
@@ -378,7 +385,7 @@ def _created_task_response(task_id: str, duration: float) -> dict:
         "state": "queued",
         "queue_position": scheduler.position(task_id),
         "audio_duration_sec": round(float(duration), 1),
-        "estimated_process_sec": round(float(duration) * settings.rtf),
+        "estimated_process_sec": round(float(duration) * _selected_rtf()),
     }
 
 

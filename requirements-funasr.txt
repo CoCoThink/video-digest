@@ -1,0 +1,6 @@
+# Optional experimental Fun-ASR-Nano backend, tested with requirements.txt.
+-r requirements.txt
+funasr==1.3.22
+modelscope==1.38.1
+sentencepiece==0.2.2
+tiktoken==0.13.0

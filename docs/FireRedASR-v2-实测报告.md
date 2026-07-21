@@ -2,6 +2,9 @@
 
 > 日期：2026-07-20
 > 目标：先在本项目的 4 GB 显卡和测试视频上跑通 FireRedASR v2，验证速度、显存、时间戳和字幕产物，再决定是否替换服务端默认 ASR。
+>
+> 文档属性：历史实测基线。§1–§10 的固定 30 秒分块、耗时和产物均保留当日口径；
+> 2026-07-21 之后的服务实现变化见 §11 和 `docs/ASR三模型接入评审与试验补充.md`。
 
 ## 1. 结论
 
@@ -193,7 +196,7 @@ beam 3 明显变慢，只修正 1 处“磁向量”，没有改善“点击”�
 当前实现状态：
 
 1. FireRedPunc 已完成服务接入；95/157 分钟全文标点 RTF 分别为 0.00271/0.00251，语义字符保留率均为 100%。
-2. `server.pipeline.asr` 已抽象为 Qwen/FireRed backend，并通过启动配置切换；默认值仍保持 Qwen。
+2. 当日 `server.pipeline.asr` 已抽象为 Qwen/FireRed backend；2026-07-21 又增加 FunASR 实验 backend，默认值仍保持 Qwen。
 3. 后续需要准备人工逐字稿或至少 3–5 条不同领域样本，计算 CER/WER，避免由现有视频直接决定默认模型选型。
 
 ## 9. 2 小时 37 分长视频对比
@@ -354,3 +357,22 @@ FireRed 原始 cue 显示覆盖率更高主要来自无标点文本被延长到 
 这条视频进一步支持当前选型：Qwen 保持默认；FireRedASR2-AED + CPU FireRedPunc
 作为显著更快、带异常重试保护的可选 backend。逐项数据和例句见
 `docs/方案设计域AI实践分享-ASR对比报告.md`。
+
+## 11. 2026-07-21 服务实现补充
+
+本节只记录接入状态变化，不回算或改写 §1–§10 的历史性能数据：
+
+- FireRed 主块从固定 30 秒硬边界改为“最大 `VD_CHUNK_SEC=30` 秒，并在目标点前
+  `VD_FIRERED_BOUNDARY_SEARCH_SEC=5` 秒内搜索最低能量位置”。新策略保持 PCM frame
+  连续、不丢不重且块长不超上限；它不是 VAD。
+- FireRedASR2S 源码目录现在必须是 revision
+  `4e7d9aaf4482a47cec1724807026b9b151926eb5` 的干净 git checkout；模型目录缺少任一
+  必需文件也会在 Worker ready 前失败。
+- `text/items` 契约校验已经提升为三 backend 公共守门：正文字符必须与 timed items
+  完全对应，时间戳必须有限、单调且不越过音频。失败统一记为
+  `ASR_OUTPUT_MISMATCH`，不再让后处理尝试修补模型级错位。
+- FireRed 当前不支持 `VD_ASR_CONTEXT`，非空时记录 `ASR_CONTEXT_UNSUPPORTED` warning；
+  不支持强制 `VD_ASR_LANGUAGE`，自动模式语言元数据为 `Unknown`。
+- 全局 factory 已新增 Fun-ASR-Nano-2512 实验 backend。该变化不影响本文 Qwen/FireRed
+  对比结论；新的三模型定位、180 秒试验和准入门槛见
+  `docs/ASR三模型接入评审与试验补充.md`。

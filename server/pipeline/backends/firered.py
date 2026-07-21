@@ -7,10 +7,9 @@ import subprocess
 import sys
 import tempfile
 import time
-import unicodedata
-import wave
 
-from .base import AsrOutputError, AsrUnstableError
+from .base import AsrUnstableError, validate_asr_output, wav_duration
+from .wav_chunks import iter_wav_chunks
 
 PINNED_SOURCE_REVISION = "4e7d9aaf4482a47cec1724807026b9b151926eb5"
 REQUIRED_MODEL_FILES = ("model.pth.tar", "dict.txt", "cmvn.ark", "train_bpe1000.model")
@@ -29,38 +28,18 @@ def _join_text(parts: list[str]) -> str:
     return text
 
 
-def _write_wav(path: Path, params, audio: bytes, frame_count: int) -> None:
-    with wave.open(str(path), "wb") as writer:
-        writer.setparams(params)
-        writer.setnframes(frame_count)
-        writer.writeframes(audio)
-
-
-def _iter_wav_chunks(source: Path, directory: Path, chunk_sec: float):
-    """Yield one exact-frame chunk at a time and delete it after consumption."""
-    if chunk_sec <= 0:
-        raise ValueError("firered chunk_sec must be positive")
-    with wave.open(str(source), "rb") as reader:
-        params = reader.getparams()
-        if params.nchannels != 1 or params.sampwidth != 2 or params.framerate != 16000:
-            raise ValueError("FireRed expects 16 kHz, 16-bit, mono PCM WAV")
-        frames_per_chunk = max(1, round(chunk_sec * params.framerate))
-        start_frame = 0
-        index = 0
-        while start_frame < params.nframes:
-            frame_count = min(frames_per_chunk, params.nframes - start_frame)
-            path = directory / f"chunk_{index:05d}.wav"
-            _write_wav(path, params, reader.readframes(frame_count), frame_count)
-            try:
-                yield (
-                    path,
-                    start_frame / params.framerate,
-                    frame_count / params.framerate,
-                )
-            finally:
-                path.unlink(missing_ok=True)
-            start_frame += frame_count
-            index += 1
+def _iter_wav_chunks(
+    source: Path,
+    directory: Path,
+    chunk_sec: float,
+    *,
+    boundary_search_sec: float = 0.0,
+):
+    """Compatibility wrapper used by tests and the FireRed retry path."""
+    return iter_wav_chunks(
+        source, directory, chunk_sec,
+        boundary_search_sec=boundary_search_sec,
+    )
 
 
 def _split_retry_chunk(source: Path, directory: Path, chunk_sec: float):
@@ -149,33 +128,11 @@ def _transcribe_with_retry(model, chunk_path: Path, offset: float, duration: flo
     return leaves, events
 
 
-def _normalized_chars(text: str) -> str:
-    return "".join(
-        ch for ch in text
-        if ch == "'" or unicodedata.category(ch)[:1] in {"L", "N"}
-    )
-
-
 def _validate_contract(data: dict, audio_duration: float) -> None:
-    source = _normalized_chars(data.get("text", ""))
-    target = "".join(_normalized_chars(str(item.get("t", ""))) for item in data["items"])
-    if source != target:
-        raise AsrOutputError(
-            f"FireRed text/items mismatch (text={len(source)}, items={len(target)})"
-        )
-    previous_end = 0.0
-    for item in data["items"]:
-        start, end = float(item["s"]), float(item["e"])
-        if (not math.isfinite(start) or not math.isfinite(end) or start < -0.001
-                or end < start or end > audio_duration + 0.25
-                or start < previous_end - 0.05):
-            raise AsrOutputError("FireRed returned invalid absolute timestamps")
-        previous_end = max(previous_end, end)
+    validate_asr_output(data, audio_duration, backend_name="FireRedASR2")
 
 
-def _add_source_dir(source_dir: Path | None) -> None:
-    if source_dir is None:
-        return
+def _add_source_dir(source_dir: Path) -> None:
     source_dir = source_dir.expanduser().resolve()
     package_parent = source_dir / "fireredasr2s"
     candidate = package_parent if (package_parent / "fireredasr2").is_dir() else source_dir
@@ -183,7 +140,7 @@ def _add_source_dir(source_dir: Path | None) -> None:
         sys.path.insert(0, str(candidate))
 
 
-def _load_api(source_dir: Path | None):
+def _load_api(source_dir: Path):
     _add_source_dir(source_dir)
     try:
         from fireredasr2.asr import FireRedAsr2, FireRedAsr2Config
@@ -228,22 +185,31 @@ class FireRedBackend:
         if missing:
             raise ValueError(f"FireRed model directory is incomplete: {', '.join(missing)}")
         source_value = cfg.get("firered_source_dir")
-        source_dir = Path(source_value).expanduser() if source_value else None
-        if source_dir is not None and not source_dir.is_dir():
-            raise ValueError(f"FireRed source directory does not exist: {source_dir}")
-        if source_dir is not None:
-            revision = subprocess.run(
-                ["git", "-C", str(source_dir), "rev-parse", "HEAD"],
-                text=True, capture_output=True,
+        if not source_value:
+            raise ValueError(
+                "VD_FIRERED_SOURCE_DIR is required for a reproducible FireRed backend"
             )
-            if revision.returncode != 0:
-                raise ValueError("VD_FIRERED_SOURCE_DIR must be a pinned git checkout")
-            actual = revision.stdout.strip()
-            if actual != PINNED_SOURCE_REVISION:
-                raise ValueError(
-                    f"unsupported FireRedASR2S revision {actual}; "
-                    f"expected {PINNED_SOURCE_REVISION}"
-                )
+        source_dir = Path(source_value).expanduser()
+        if not source_dir.is_dir():
+            raise ValueError(f"FireRed source directory does not exist: {source_dir}")
+        revision = subprocess.run(
+            ["git", "-C", str(source_dir), "rev-parse", "HEAD"],
+            text=True, capture_output=True,
+        )
+        if revision.returncode != 0:
+            raise ValueError("VD_FIRERED_SOURCE_DIR must be a pinned git checkout")
+        actual = revision.stdout.strip()
+        if actual != PINNED_SOURCE_REVISION:
+            raise ValueError(
+                f"unsupported FireRedASR2S revision {actual}; "
+                f"expected {PINNED_SOURCE_REVISION}"
+            )
+        dirty = subprocess.run(
+            ["git", "-C", str(source_dir), "status", "--porcelain"],
+            text=True, capture_output=True,
+        )
+        if dirty.returncode != 0 or dirty.stdout.strip():
+            raise ValueError("VD_FIRERED_SOURCE_DIR must be a clean pinned checkout")
         if not torch.cuda.is_available():
             raise RuntimeError("FireRed backend requires CUDA")
 
@@ -274,17 +240,30 @@ class FireRedBackend:
             self.model_id = "FireRedASR2-AED+FireRedPunc"
         self._chunk_sec = float(cfg.get("chunk_sec", 30))
         self._min_chunk_sec = float(cfg.get("firered_min_chunk_sec", 7.5))
+        self._boundary_search_sec = float(
+            cfg.get("firered_boundary_search_sec", 5.0)
+        )
         if self._min_chunk_sec <= 0 or self._min_chunk_sec > self._chunk_sec:
             raise ValueError("VD_FIRERED_MIN_CHUNK_SEC must be in (0, VD_CHUNK_SEC]")
+        if not 0 <= self._boundary_search_sec < self._chunk_sec:
+            raise ValueError(
+                "VD_FIRERED_BOUNDARY_SEARCH_SEC must be in [0, VD_CHUNK_SEC)"
+            )
 
     @staticmethod
     def _duration(path: Path) -> float:
-        with wave.open(str(path), "rb") as reader:
-            return reader.getnframes() / reader.getframerate()
+        return wav_duration(str(path))
 
-    def transcribe(self, audio_path: str, *, language=None, progress_cb=None) -> dict:
+    def transcribe(
+        self, audio_path: str, *, language=None, context="", progress_cb=None,
+    ) -> dict:
         import torch
 
+        if language is not None and str(language).strip():
+            raise ValueError(
+                "FireRedASR2-AED does not support forced language; "
+                "leave VD_ASR_LANGUAGE empty"
+            )
         source = Path(audio_path)
         duration = self._duration(source)
         chunk_total = max(1, math.ceil(duration / self._chunk_sec))
@@ -302,7 +281,10 @@ class FireRedBackend:
                 retry_dir = temp_dir / "retries"
                 with torch.no_grad():
                     for index, (path, offset, chunk_duration) in enumerate(
-                            _iter_wav_chunks(source, temp_dir, self._chunk_sec), 1):
+                            _iter_wav_chunks(
+                                source, temp_dir, self._chunk_sec,
+                                boundary_search_sec=self._boundary_search_sec,
+                            ), 1):
                         leaves, events = _transcribe_with_retry(
                             self._model, path, offset, chunk_duration,
                             retry_dir, self._min_chunk_sec,
@@ -340,17 +322,25 @@ class FireRedBackend:
                                 pass
             data = {
                 "text": _join_text(text_parts),
-                "language": language or "Chinese",
+                "language": "Unknown",
                 "items": items,
                 "backend": self.name,
                 "model_id": self.model_id,
                 "warnings": [
                     {"code": "ASR_CHUNK_RETRIED", **event} for event in retry_events
-                ] + punc_warnings,
+                ] + punc_warnings + ([{
+                    "code": "ASR_CONTEXT_UNSUPPORTED",
+                    "message": "FireRedASR2-AED does not accept context terms",
+                }] if context.strip() else []),
                 "punctuation": self._punctuation is not None,
                 "_punc_sec": round(punc_elapsed, 3),
             }
             _validate_contract(data, duration)
+            if progress_cb:
+                try:
+                    progress_cb(99)
+                except Exception:
+                    pass
             return data
 
         try:

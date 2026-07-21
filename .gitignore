@@ -8,7 +8,9 @@
 # 测试字幕 / 转写输出
 *.srt
 *.txt
+!requirements.txt
 !requirements-firered.txt
+!requirements-funasr.txt
 
 # 转写派生产物（对齐 items、指标）
 items.*.json

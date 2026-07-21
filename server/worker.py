@@ -93,6 +93,7 @@ def _process_one(backend, cfg, tdir, task_id, log):
     store.start_stage(tdir, "transcribing")
     data = backend.transcribe(
         str(wav), language=cfg.get("asr_language"),
+        context=str(cfg.get("asr_context") or ""),
         progress_cb=lambda p: store.update_progress(tdir, p),
     )
     peak = data.pop("_peak_gpu_gb", None)

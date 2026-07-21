@@ -18,6 +18,9 @@ def create_backend(cfg: dict):
     if name == "firered":
         from server.pipeline.backends.firered import FireRedBackend
         return FireRedBackend(cfg)
+    if name == "funasr":
+        from server.pipeline.backends.funasr import FunAsrBackend
+        return FunAsrBackend(cfg)
     raise ValueError(f"unsupported ASR backend: {name!r}")
 
 
@@ -114,7 +117,9 @@ def _align_one(model, chunk, text: str, language: str):
     return model._offset_align_result(result, chunk.offset_sec)
 
 
-def _transcribe_pipelined(model, audio_path: str, language, progress: _Progress | None):
+def _transcribe_pipelined(
+    model, audio_path: str, language, context: str, progress: _Progress | None,
+):
     """逐块 GPU ASR，并在单独 CPU 线程对齐上一块。
 
     qwen-asr 0.0.6 的原实现先完成全部 ASR 再开始全部对齐。本项目固定 batch=1，
@@ -155,7 +160,7 @@ def _transcribe_pipelined(model, audio_path: str, language, progress: _Progress 
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="forced-align")
     try:
         for idx, chunk in enumerate(chunks):
-            raw = model._infer_asr([""], [chunk.wav], [language_norm])[0]
+            raw = model._infer_asr([context], [chunk.wav], [language_norm])[0]
             lang_pred, text = _qa.parse_asr_output(raw, user_language=language_norm)
             per_chunk_lang.append(lang_pred)
             per_chunk_text.append(text)
@@ -194,7 +199,9 @@ def _transcribe_pipelined(model, audio_path: str, language, progress: _Progress 
     )
 
 
-def transcribe(model, audio_path: str, language=None, progress_cb=None) -> dict:
+def transcribe(
+    model, audio_path: str, language=None, context: str = "", progress_cb=None,
+) -> dict:
     """转写 + 对齐，返回 items.json 结构（全文 + 逐 token 时间戳）。
 
     OOM 自愈（R4）：捕获显存不足（含普通 RuntimeError 形态，见 _is_oom）→
@@ -210,7 +217,9 @@ def transcribe(model, audio_path: str, language=None, progress_cb=None) -> dict:
 
     def _run():
         with torch.no_grad():
-            return _transcribe_pipelined(model, audio_path, language, progress)
+            return _transcribe_pipelined(
+                model, audio_path, language, context.strip(), progress,
+            )
 
     try:
         result = _run()
@@ -233,6 +242,10 @@ def transcribe(model, audio_path: str, language=None, progress_cb=None) -> dict:
             for it in (items or [])
         ],
     }
+    from server.pipeline.backends.base import validate_asr_output, wav_duration
+    validate_asr_output(
+        data, wav_duration(audio_path), backend_name="Qwen3-ASR",
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         data["_peak_gpu_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 3)

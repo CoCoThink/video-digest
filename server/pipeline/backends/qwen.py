@@ -12,11 +12,14 @@ class QwenBackend:
         self.model_id = cfg["asr_model_path"]
         self._model = asr.load_model(cfg)
 
-    def transcribe(self, audio_path: str, *, language=None, progress_cb=None) -> dict:
+    def transcribe(
+        self, audio_path: str, *, language=None, context="", progress_cb=None,
+    ) -> dict:
         from server.pipeline import asr
 
         data = asr.transcribe(
-            self._model, audio_path, language=language, progress_cb=progress_cb,
+            self._model, audio_path, language=language, context=context,
+            progress_cb=progress_cb,
         )
         data["backend"] = self.name
         data["model_id"] = self.model_id

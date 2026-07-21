@@ -2,13 +2,13 @@
 
 | 项目 | 内容 |
 |---|---|
-| 版本 | v1.1 |
-| 日期 | 2026-07-20 |
-| 状态 | FireRedASR2-AED 与 FireRedPunc 核心接入已实现 |
+| 版本 | v1.2 |
+| 日期 | 2026-07-21 |
+| 状态 | 已实现并加固：固定源码校验、低能量边界、公共输出契约和上下文能力声明 |
 | 范围 | FireRedASR2-AED 可选快速 backend；不替换 Qwen 默认路径 |
 | 依据 | `FireRedASR-v2-实测报告.md`、`方案设计域AI实践分享-ASR对比报告.md` |
 
-实现落点（2026-07-20）：
+实现落点（截至 2026-07-21）：
 
 - 已实现启动级 backend 工厂、Qwen 兼容包装和 FireRedASR2-AED 常驻后端；
 - 已实现精确 PCM 切块、BF16 forced-align 兼容、异常检测、递归二分与 OOM 重试；
@@ -16,6 +16,10 @@
 - 已通过 29 项自动测试和 10 秒音频完整 API 烟雾测试；
 - 已实现 FireRedPunc CPU 常驻、逐块推理、严格字符投影和单块 fail-open；保留显式开关，FireRed 部署推荐启用。
 - 95/157 分钟全文标点实测 RTF 为 0.00271/0.00251，语义字符保留率均为 100%，无投影降级。
+- 已要求 FireRedASR2S 源码为指定 revision 的干净 git checkout，避免本地补丁或上游漂移改变推理行为。
+- 已把硬 30 秒边界升级为“最大 30 秒、目标点前默认 5 秒低能量搜索”；时间轴仍按 PCM frame 连续且不丢不重。
+- 统一 backend 接口已扩展 `context` 参数；FireRed 不支持时记录 `ASR_CONTEXT_UNSUPPORTED`，强制语言则明确拒绝。
+- 当前全局 factory 另含 FunASR 实验 backend，整体选型见 `docs/ASR三模型接入评审与试验补充.md`；本文仍只约束 FireRed 路径。
 
 ## 1. 目标与边界
 
@@ -29,16 +33,16 @@
 
 ### 1.2 非目标
 
-- 首期不做前端逐任务模型选择，也不在同一 Worker 内同时加载两套 ASR。
+- 首期不做前端逐任务模型选择，也不在同一 Worker 内同时加载多个 ASR。
 - 不接入 8B+ 的 FireRedASR2-LLM；4 GB GPU 不满足其常驻条件。
-- 不在首期引入 FireRedVAD/LID。现有 30 秒切块已经跑通；VAD 属后续独立优化。
+- 不引入 FireRedVAD/LID。当前只做目标切点前的低能量搜索，它不检测语音活动、不删除静音；完整 VAD 仍属后续独立优化。
 - 没有人工标注集前，不宣称 FireRed 或 Qwen 的总体 CER 更优。
 
 ## 2. 关键决策
 
 ### 2.1 启动级切换
 
-新增 `VD_ASR_BACKEND=qwen|firered`，默认 `qwen`。Scheduler 启动 Worker 时把完整
+全局配置为 `VD_ASR_BACKEND=qwen|firered|funasr`，默认 `qwen`。Scheduler 启动 Worker 时把完整
 配置传入；Worker 只构造选中的 backend，并在其生命周期内常驻。
 
 ```text
@@ -48,6 +52,7 @@ API / Scheduler（不 import torch）
               v
 GPU Worker -> backend factory -> QwenBackend    （默认）
                             \-> FireRedBackend  （快速）
+                            \-> FunAsrBackend   （实验，详见三模型补充）
 ```
 
 不采用逐任务切换的原因：RTX 3050 4 GB 无法同时常驻两套模型；模型交换会引入
@@ -61,9 +66,11 @@ GPU Worker -> backend factory -> QwenBackend    （默认）
 
 ```text
 server/pipeline/asr.py                 # factory / facade，保持现有 import 稳定
-server/pipeline/backends/base.py       # Protocol + 公共数据结构
+server/pipeline/backends/base.py       # Protocol + 上下文解析 + 公共输出校验
 server/pipeline/backends/qwen.py       # 迁移现有实现，行为不变
 server/pipeline/backends/firered.py    # AED、切块、重试、时间偏移
+server/pipeline/backends/funasr.py     # FunASR 实验 backend（非本文重点）
+server/pipeline/backends/wav_chunks.py # FireRed/FunASR 公共 PCM 切块
 server/pipeline/punctuation.py         # FireRedPunc 适配与字符投影
 ```
 
@@ -76,6 +83,7 @@ class AsrBackend(Protocol):
 
     def transcribe(
         self, audio_path: str, *, language: str | None,
+        context: str = "",
         progress_cb: Callable[[int], None] | None,
     ) -> dict: ...
 ```
@@ -99,12 +107,15 @@ class AsrBackend(Protocol):
 - `text` 经 Qwen 对齐器同款 Unicode 规则归一化后，必须与 `items[].t` 拼接结果一致；
 - 不满足契约时任务明确失败或标点层降级，禁止静默丢字、伪造成功时间戳；
 - `layout`、`subtitle` 和下载 API 不感知具体 backend。
+- `context` 非空时 FireRed 不静默接受：产物 warning 记录 `ASR_CONTEXT_UNSUPPORTED`；
+  `language` 非空则启动任务后明确失败，因为 AED 当前接口不支持强制语言。
 
 ## 3. FireRed 转写流程
 
 ```text
 audio_16k.wav
-  -> PCM frame 精确迭代 30 s 主块
+  -> PCM frame 精确迭代最大 30 s 主块
+     -> 目标切点前 5 s 内搜索低能量边界
   -> FireRedASR2-AED BF16 / beam 1
   -> 检测正文、token 密度、时间戳合法性与均匀回退
        正常 -> 恢复绝对 offset
@@ -121,7 +132,9 @@ audio_16k.wav
 - 输入沿用公共 `preprocess.to_wav_16k()`，不重复重采样。
 - 按 WAV frame 计算 offset，禁止用累计浮点切割，确保长视频无漂移。
 - 每次只写当前主块和其重试子块，处理完立即删除；不预先复制整条 WAV 为 N 个文件。
-- 默认主块 30 秒、最小重试块 7.5 秒。保留 30 秒硬边界，与两次长视频实测一致。
+- 默认最大主块 30 秒、低能量搜索窗口 5 秒、最小重试块 7.5 秒。边界只向前移动，
+  因此块长不超上限；所有 offset 由 frame 计算，连续覆盖原 WAV。历史实测仍是固定
+  30 秒边界，新增策略已由切块单元测试验证，但不能据此改写历史性能数据。
 
 ### 3.2 异常检测与二分
 
@@ -185,15 +198,15 @@ for task_id in task_q:
     _process_one(backend, cfg, ...)
 ```
 
-增加独立 `multiprocessing.Event` 表示模型真正加载完成；`/api/health` 和
-`/api/config` 的 `model_loaded` 读取 Event，而不是仅判断进程存活。backend 路径、
+增加独立 `multiprocessing.Event` 表示模型真正加载完成；`/api/health` 的
+`model_loaded` 读取 Event，而不是仅判断进程存活。backend 路径、
 依赖或 checkpoint 配错导致 Worker 启动失败时，健康检查必须明确为未就绪。
 
 ### 5.2 进度
 
-FireRed 以“完成的 30 秒主块 / 主块总数”为进度分母。递归子块不让进度回退，也不
-虚增总进度；当前主块的所有叶子成功后才完成该主块。进度限制为 1–99，进入
-`postprocessing` 后由现有状态机收尾。
+FireRed 以“完成的主块 / `ceil(duration/chunk_sec)`”为进度基准。低能量搜索可能使
+实际主块数略多，循环末尾显式补到 99；递归子块不让进度回退，也不虚增进度，当前
+主块的所有叶子成功后才完成该主块。进入 `postprocessing` 后由现有状态机收尾。
 
 ### 5.3 错误和降级
 
@@ -201,7 +214,7 @@ FireRed 以“完成的 30 秒主块 / 主块总数”为进度分母。递归�
 |---|---|
 | AED OOM | 复用 `GPU_OOM` 分类；清缓存整任务重试一次，仍失败则终止 |
 | 最小块仍异常 | `ASR_UNSTABLE`，任务失败并保留诊断日志 |
-| Punc 加载失败 | backend 启动不就绪；若配置为 optional，可禁用后启动并警告 |
+| Punc 加载失败 | backend 启动不就绪；关闭 `VD_FIRERED_PUNC_ENABLED` 后重启可回退到无标点 AED |
 | Punc 单块失败/改词 | 使用原始无标点正文，记录 warning，任务继续 |
 | text/items 不一致 | `ASR_OUTPUT_MISMATCH`，禁止生成残缺字幕 |
 | checkpoint/source 不存在 | Worker 不 ready，健康接口暴露配置错误摘要 |
@@ -212,11 +225,13 @@ FireRed 以“完成的 30 秒主块 / 主块总数”为进度分母。递归�
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `VD_ASR_BACKEND` | `qwen` | `qwen` / `firered`，启动时生效 |
+| `VD_ASR_BACKEND` | `qwen` | 全局支持 `qwen` / `firered` / `funasr`；本文取 `firered` |
+| `VD_ASR_CONTEXT` | 空 | FireRed 不消费；非空时写 `ASR_CONTEXT_UNSUPPORTED` warning |
 | `VD_FIRERED_MODEL_PATH` | 空 | AED checkpoint，选择 FireRed 时必填 |
-| `VD_FIRERED_SOURCE_DIR` | 空 | 固定版本源码目录；安装为包后可省略 |
+| `VD_FIRERED_SOURCE_DIR` | 空 | 指定 revision 的干净 git checkout；选择 FireRed 时必填 |
 | `VD_FIRERED_BEAM_SIZE` | `1` | 实测 beam 3 收益不足且更慢 |
 | `VD_FIRERED_MIN_CHUNK_SEC` | `7.5` | 异常二分下限 |
+| `VD_FIRERED_BOUNDARY_SEARCH_SEC` | `5` | 在目标切点前搜索低能量边界，必须小于 `VD_CHUNK_SEC` |
 | `VD_FIRERED_PUNC_ENABLED` | `false` | 显式启用；FireRed 部署推荐 `true`，保留快速回滚开关 |
 | `VD_FIRERED_PUNC_MODEL_PATH` | 空 | FireRedPunc checkpoint |
 | `VD_FIRERED_PUNC_DEVICE` | `cpu` | 已完成 CPU 实测；4 GB GPU 推荐保持 CPU |
@@ -237,8 +252,9 @@ FireRed 以“完成的 30 秒主块 / 主块总数”为进度分母。递归�
   `4677cbd30988d63ed3e777f6a42a1e5260a3865317f6e15e488bef40954f7054`。
 - 官方仓库为 Apache-2.0，并提供独立 AED/Punc Python API。部署镜像应 clone 固定
   commit 或安装由该 commit 构建的 wheel，不允许运行时跟随 `main`。
-- 当前补充依赖：`cn2an==0.5.23`、`kaldiio==2.18.1`、
-  `kaldi_native_fbank==1.15`、`textgrid==1.6.1`。实现时应建立正式锁定文件。
+- 当前补充依赖已锁定在 `requirements-firered.txt`：`cn2an==0.5.23`、
+  `kaldiio==2.18.1`、`kaldi_native_fbank==1.15`、`textgrid==1.6.1`；该文件通过
+  `-r requirements.txt` 复用公共/Qwen 基础环境。
 - FireRedPunc `model.pth.tar` SHA-256：
   `9a69e465132c79f639ba5a057cf06c90b2d7e36e4bbea56225ece260dcd0b0d4`。
 
@@ -252,7 +268,7 @@ FireRed 以“完成的 30 秒主块 / 主块总数”为进度分母。递归�
 
 ### 8.1 自动测试
 
-1. backend factory：默认 Qwen、非法名称拒绝、FireRed 缺路径时不 ready。
+1. backend factory：默认 Qwen、三种合法名称可分派、非法名称拒绝、FireRed 缺路径时不 ready。
 2. Qwen 回归：同一 `items.json`、SRT、TXT 与改造前 byte-identical。
 3. PCM 切块：总 frame 不丢不重，offset 精确，末块正确。
 4. FireRed 异常：无时间戳、token 过密、均匀回退、非法时间戳均触发二分。
@@ -260,6 +276,9 @@ FireRed 以“完成的 30 秒主块 / 主块总数”为进度分母。递归�
 6. 标点投影：只加标点时成功；改词、漏词、撇号变化时 fail-open。
 7. 统一契约：正文/token 100% 对应，时间戳单调，cue 无非法区间/重叠。
 8. Worker：ready Event、backend 元数据、错误分类和 respawn。
+9. **待补单测**：源码守门应覆盖非固定 revision、dirty checkout、缺少 checkpoint 文件均拒绝启动；当前实现已具备检查，仍需隔离 git fixture。
+10. 低能量切块：边界偏向安静区、总 frame 不丢不重、块长不越过上限。
+11. 能力声明：context 产生 warning；强制 language 明确拒绝；自动语言记录 `Unknown`。
 
 ### 8.2 真实样本门槛
 
@@ -278,8 +297,10 @@ FireRed 以“完成的 30 秒主块 / 主块总数”为进度分母。递归�
 2. **已完成：接入 AED**：迁移切块、BF16 兼容、异常检测和递归二分。
 3. **已完成：接入 Punc**：完成 CPU 资源实测、字符投影、fail-open 和长视频复跑。
 4. **已完成：可观测性**：ready Event、backend 元数据、重试/warning 日志和健康接口。
-5. **待灰度**：测试环境用 `VD_ASR_BACKEND=firered` 跑现有三条样本和人工稿；生产
-   初期保持 Qwen，FireRed 只作为独立快速部署配置。
+5. **已完成：可复现性与边界优化**：强制固定且干净的源码 checkout；加入公共输出
+   校验、上下文 warning、语言能力校验和低能量主块边界。
+6. **待灰度**：测试环境用 `VD_ASR_BACKEND=firered` 跑人工稿；生产初期保持 Qwen，
+   FireRed 只作为独立快速部署配置。
 
 回滚只需恢复 `VD_ASR_BACKEND=qwen` 并重启服务。任务产物仍为统一 SRT/TXT，历史
 任务不需迁移；status 中的 backend 元数据用于区分来源。

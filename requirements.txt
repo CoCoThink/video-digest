@@ -1,0 +1,14 @@
+# Reproducible Python 3.11 environment used by the default Qwen backend.
+# ffmpeg remains a system dependency. The extra index selects CUDA 12.8 wheels.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.9.1
+torchaudio==2.9.1
+qwen-asr==0.0.6
+transformers==4.57.6
+bitsandbytes==0.49.2
+numpy==2.2.6
+jieba==0.42.1
+fastapi==0.139.0
+pydantic==2.13.4
+pydantic-settings==2.14.2
+uvicorn==0.51.0

@@ -1,5 +1,9 @@
 # Qwen3-ASR 本机部署与实测报告
 
+> 文档属性：Qwen 历史实测基线，保留当时脚本参数和测量结果。服务端当前仍默认
+> Qwen，但已支持 FireRed 快速 backend 和 FunASR 实验 backend；现行选型与统一
+> 契约见 `docs/ASR三模型接入评审与试验补充.md`。
+
 > 目标：在本机 4 GB 显卡上跑通 Qwen3-ASR（GPU），从视频提取字幕，并对比 0.6B / 1.7B / int8 等方案的速度、资源、准确性。
 > 视频：`Transformer其实是个简单的架构.mkv`（时长 606 s ≈ 10 min）。
 

@@ -24,19 +24,25 @@ class Settings(BaseSettings):
     data_dir: Path = Path("./data")
 
     # 模型（支持本地目录或 HF/ModelScope 仓库名，从缓存解析）
-    asr_backend: Literal["qwen", "firered"] = "qwen"
+    asr_backend: Literal["qwen", "firered", "funasr"] = "qwen"
     asr_model_path: str = "Qwen/Qwen3-ASR-1.7B"
     aligner_model_path: str = "Qwen/Qwen3-ForcedAligner-0.6B"
     load_8bit: bool = True
+    # Qwen 将其作为自由文本上下文；FunASR 按逗号/分号/换行解析为热词。
+    asr_context: str = ""
     # FireRedASR2-AED 快速后端。模型目录包含 model.pth.tar/dict.txt/cmvn.ark；
-    # source_dir 指向固定 revision 的 FireRedASR2S checkout，安装为包后可留空。
+    # source_dir 必须指向固定 revision 的干净 FireRedASR2S checkout。
     firered_model_path: Path | None = None
     firered_source_dir: Path | None = None
     firered_beam_size: int = 1
     firered_min_chunk_sec: float = 7.5
+    firered_boundary_search_sec: float = 5.0
     firered_punc_enabled: bool = False
     firered_punc_model_path: Path | None = None
     firered_punc_device: Literal["cpu", "cuda"] = "cpu"
+    # Fun-ASR-Nano 实验后端；固定 FunASR 版本见 requirements-funasr.txt。
+    funasr_model_path: str = "FunAudioLLM/Fun-ASR-Nano-2512"
+    funasr_boundary_search_sec: float = 5.0
     # 分块秒数：每块 GPU 峰值随块长增长。4GB 卡上常驻 int8 模型基线约占 3.07GB
     # reserved（仅 ~1GB 余量），而峰值是**内容相关**的——语速密集的块生成 token 多、
     # 音频编码器激活大，单块瞬时分配可再高 0.5–1GB。45s 时密集块会越过 4GB，触发
@@ -63,6 +69,7 @@ class Settings(BaseSettings):
     # 前端预估用实时率（经 /api/config 下发）
     rtf: float = 0.65
     firered_rtf: float = 0.12
+    funasr_rtf: float = 0.13
 
     # 排版参数（build_srt_layout 默认值；R5 英文适配时按语言切换参数组）
     layout_min_dur: float = 1.0

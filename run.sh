@@ -22,34 +22,51 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export no_proxy="${no_proxy:+$no_proxy,}hf-mirror.com"
 export NO_PROXY="${NO_PROXY:+$NO_PROXY,}hf-mirror.com"
 
+# 从 .env 取某个 VD_ 变量（去掉可能的成对引号）；无 .env 或未定义则空。
+get_env() {
+  [[ -f .env ]] || return 0
+  sed -n "s/^$1=//p" .env | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+BACKEND="${VD_ASR_BACKEND:-$(get_env VD_ASR_BACKEND)}"
+BACKEND="${BACKEND:-qwen}"
+
 # ---- 1) 解析 Python 解释器 ------------------------------------------------
+has_backend() {
+  case "$BACKEND" in
+    qwen) "$1" -c 'import fastapi, pydantic_settings, qwen_asr' >/dev/null 2>&1 ;;
+    firered) "$1" -c 'import fastapi, pydantic_settings, torch, torchaudio' >/dev/null 2>&1 ;;
+    funasr) "$1" -c 'import fastapi, pydantic_settings, funasr' >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
 pick_python() {
   if [[ -n "${VD_PYTHON:-}" ]]; then echo "$VD_PYTHON"; return; fi
-  # 已激活且装好依赖的环境优先
+  # 已激活且装好所选后端依赖的环境优先。
   if [[ -n "${CONDA_PREFIX:-}" && -x "$CONDA_PREFIX/bin/python" ]] \
-     && "$CONDA_PREFIX/bin/python" -c 'import qwen_asr' >/dev/null 2>&1; then
+     && has_backend "$CONDA_PREFIX/bin/python"; then
     echo "$CONDA_PREFIX/bin/python"; return
   fi
   # 本机 mamba env qwen-asr 的常见位置
   for p in "$HOME/mamba/envs/qwen-asr/bin/python" \
            "$HOME/miniconda3/envs/qwen-asr/bin/python" \
            "$HOME/micromamba/envs/qwen-asr/bin/python"; do
-    [[ -x "$p" ]] && { echo "$p"; return; }
+    [[ -x "$p" ]] && has_backend "$p" && { echo "$p"; return; }
   done
-  command -v python3 || command -v python   # 兜底：PATH 中的 python
+  for name in python3 python; do
+    p="$(command -v "$name" 2>/dev/null || true)"
+    [[ -n "$p" ]] && has_backend "$p" && { echo "$p"; return; }
+  done
+  return 1
 }
 PY="$(pick_python)" || true
 if [[ -z "${PY:-}" || ! -x "$(command -v "$PY" 2>/dev/null || echo "$PY")" ]]; then
-  echo "✗ 未找到可用的 Python。请设置 VD_PYTHON 指向已装 qwen-asr 栈的解释器。" >&2
+  echo "✗ 未找到可用的 Python。请设置 VD_PYTHON 指向已安装所选 ASR 后端的解释器。" >&2
   exit 1
 fi
 
 # ---- 2) 读取监听地址/端口（供预检；应用侧由 pydantic 从环境/.env 再读一次）----
-# 从 .env 取某个 VD_ 变量（去掉可能的成对引号）；无 .env 或未定义则空。
-get_env() {
-  [[ -f .env ]] || return 0
-  sed -n "s/^$1=//p" .env | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
-}
 HOST="${VD_HOST:-$(get_env VD_HOST)}"; HOST="${HOST:-0.0.0.0}"
 PORT="${VD_PORT:-$(get_env VD_PORT)}"; PORT="${PORT:-8200}"
 

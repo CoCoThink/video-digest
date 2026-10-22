@@ -73,7 +73,9 @@ class FakeModel:
 
 
 class PipelineTest(unittest.TestCase):
-    def run_pipeline(self, outputs, offsets, model, language=None, progress=None):
+    def run_pipeline(
+        self, outputs, offsets, model, language=None, context="", progress=None,
+    ):
         chunks = [(f"chunk-{i}", offset) for i, offset in enumerate(offsets)]
 
         def parse(raw, user_language=None):
@@ -85,7 +87,9 @@ class PipelineTest(unittest.TestCase):
             patch.object(qa, "parse_asr_output", side_effect=parse),
             patch.object(qa, "merge_languages", return_value="Chinese"),
         ):
-            return _transcribe_pipelined(model, "audio.wav", language, progress)
+            return _transcribe_pipelined(
+                model, "audio.wav", language, context, progress,
+            )
 
     def test_overlaps_alignment_and_preserves_chunk_order_and_offsets(self):
         started = threading.Event()
@@ -110,7 +114,23 @@ class PipelineTest(unittest.TestCase):
         )
         self.assertEqual([call[0] for call in model.forced_aligner.calls],
                          ["chunk-0", "chunk-1", "chunk-2"])
+        self.assertEqual([call[0] for call in model.asr_calls], ["", "", ""])
         self.assertEqual(percentages, [16, 33, 50, 66, 83, 99])
+
+    def test_forwards_context_to_every_qwen_chunk(self):
+        raw_to_text = {"raw-0": "甲", "raw-1": "乙"}
+        model = FakeModel(
+            {"chunk-0": "raw-0", "chunk-1": "raw-1"}, FakeAligner(),
+        )
+
+        self.run_pipeline(
+            raw_to_text, [0.0, 30.0], model, context="设计域, SDK",
+        )
+
+        self.assertEqual(
+            [call[0] for call in model.asr_calls],
+            ["设计域, SDK", "设计域, SDK"],
+        )
 
     def test_skips_silent_chunk_without_inventing_alignment_progress(self):
         raw_to_text = {"raw-0": "甲", "raw-1": ""}

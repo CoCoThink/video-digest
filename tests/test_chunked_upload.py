@@ -160,6 +160,16 @@ class ChunkedUploadTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("GET", methods)
         self.assertNotIn("POST", methods)
 
+    async def test_task_estimate_uses_selected_backend_rtf(self):
+        with (
+            patch.object(main.settings, "asr_backend", "firered"),
+            patch.object(main.settings, "rtf", 0.65),
+            patch.object(main.settings, "firered_rtf", 0.12),
+        ):
+            response = main._created_task_response("task", 100)
+
+        self.assertEqual(response["estimated_process_sec"], 12)
+
 
 if __name__ == "__main__":
     unittest.main()
